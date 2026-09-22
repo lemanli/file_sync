@@ -5,22 +5,19 @@ on:
 permissions:
   contents: write
 jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
   release:
+    needs: checks
     runs-on: ubuntu-latest
     env:
       PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Validate version and run tests
+      - name: Validate version
         shell: bash
         run: |
           test "$GITHUB_REF_NAME" = "v$(cat VERSION)"
-          python -m pip install -r backend/requirements-standalone-test.txt
-          python -m unittest discover -s test -p 'test_*.py'
-          python scripts/smoke_test.py
       - name: Build source archives and checksums
         shell: bash
         run: |
