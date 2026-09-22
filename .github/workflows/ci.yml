@@ -27,13 +27,7 @@ jobs:
         run: python -m unittest discover -s test -p 'test_*.py'
       - name: Windows deployment and API tests
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $patterns = @('test_auto_deploy.py', 'test_install_sources.py', 'test_preflight.py', 'test_log_queries.py', 'test_progress.py')
-          foreach ($pattern in $patterns) {
-            python -m unittest discover -s test -p $pattern
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+        run: python scripts/ci_tests.py test_auto_deploy.py test_install_sources.py test_preflight.py test_log_queries.py test_progress.py
       - name: Isolated application smoke test
         run: python scripts/smoke_test.py
       - name: Windows launch script preparation
