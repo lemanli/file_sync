@@ -1,0 +1,19 @@
+# 本机环境、业务数据与生成文件
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.DS_Store
+.idea/
+.vscode/
+.codex/
+node_modules/
+data/
+logs/
+*.log
+*.sqlite*
+artifacts/
+dist/
+.env
+.env.*

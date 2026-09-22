@@ -1,0 +1,7 @@
+# 单机版仅供本机访问，不依赖 MySQL、Redis 或登录管理。
+app:
+  host: 127.0.0.1
+  port: 9098
+database:
+  # 相对路径以项目根目录解析；备份时关闭程序再复制 data 目录。
+  path: data/standalone/file_sync.sqlite3

@@ -1,0 +1,2 @@
+-r requirements-standalone.txt
+httpx==0.28.1
