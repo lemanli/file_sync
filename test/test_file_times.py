@@ -1,3 +1,4 @@
+from contextlib import closing
 """跨文件系统比较与时间保留：所有操作限定在临时目录。"""
 import os
 import sys
@@ -104,7 +105,7 @@ class FileTimeTests(unittest.TestCase):
         database=Path(self.tmp.name)/'db'/'legacy.sqlite3'
         app=create_app(database)
         legacy=dict(name='old',source=str(self.a),target=str(self.b),checksum=True,updateOnly=True,maxRetries=0)
-        with sqlite3.connect(database) as db:
+        with closing(sqlite3.connect(database)) as db, db:
             db.execute('INSERT INTO tasks(config) VALUES(?)',(json.dumps(legacy),))
         with TestClient(app) as client:
             saved=client.get('/api/tasks').json()[0]

@@ -1,3 +1,4 @@
+from contextlib import closing
 """日志筛选必须覆盖整次执行，报告和翻页不得依赖前端当前页。"""
 import json
 import sqlite3
@@ -14,7 +15,7 @@ class LogQueryTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.db=Path(self.tmp.name)/'db.sqlite3'
         app=create_app(self.db)
-        with sqlite3.connect(self.db) as db:
+        with closing(sqlite3.connect(self.db)) as db, db:
             db.execute("INSERT INTO runs(id,task_id,status,started,snapshot) VALUES(1,1,'failed','now',?)",(json.dumps({'name':'测试','dryRun':False}),))
             events=[dict(action='copied',path=f'目录/file-{i}.txt',bytes=10,mappingIndex=1) for i in range(1201)]
             events += [dict(action='skipped',path='100%_ok.txt',bytes=0,mappingIndex=2),dict(action='ignored',path='.git',bytes=0,mappingIndex=2),dict(action='mapping_failed',error='failed',mappingIndex=2)]
@@ -51,7 +52,7 @@ class LogQueryTests(unittest.TestCase):
         self.assertEqual(len(self.client.get('/api/runs/1/events').json()),500)
 
     def test_legacy_single_mapping(self):
-        with sqlite3.connect(self.db) as db:
+        with closing(sqlite3.connect(self.db)) as db, db:
             db.execute("INSERT INTO events(run_id,created,detail) VALUES(1,'now',?)",(json.dumps(dict(action='copied',path='legacy.txt',bytes=7)),))
         self.assertEqual(self.query(mapping=1,q='legacy')['total'],1)
         self.assertEqual(self.query(mapping=2,q='legacy')['total'],0)
