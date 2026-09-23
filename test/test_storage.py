@@ -93,3 +93,11 @@ class StorageTests(unittest.TestCase):
             result=subprocess.run([sys.executable,'-I',str(ROOT/'backend/standalone_app.py'),'--config',str(config),'--migrate-only'],capture_output=True,text=True)
         self.assertNotEqual(result.returncode,0)
         with closing(sqlite3.connect(old)) as db:self.assertEqual(db.execute('SELECT status FROM runs').fetchone()[0],'running')
+
+    def test_isolated_entry_migration_with_non_unicode_output_pipe(self):
+        old=self.old_database();config=self.root/'encoding.yml'
+        config.write_text('app:\n  host: 127.0.0.1\ndatabase:\n  directory: '+json.dumps(str(self.root/'new'))+'\n  migrate_from: '+json.dumps(str(old))+'\n',encoding='utf-8')
+        code="import sys,runpy;sys.stdout.reconfigure(encoding='cp1252',errors='strict');sys.stderr.reconfigure(encoding='cp1252',errors='strict');sys.argv=sys.argv[1:];runpy.run_path(sys.argv[0],run_name='__main__')"
+        result=subprocess.run([sys.executable,'-I','-c',code,str(ROOT/'backend/standalone_app.py'),'--config',str(config),'--migrate-only'],capture_output=True)
+        self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace'))
+        self.assertIn('数据准备完成',result.stdout.decode('utf-8'))

@@ -15,6 +15,10 @@ from standalone.storage import DatabaseLock, prepare_database
 ROOT = Path(__file__).resolve().parents[1]
 
 def main():
+    # -I 会忽略 PYTHONUTF8；Windows 管道可能仍为 cp1252，显式统一中文输出。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='backslashreplace')
     parser = argparse.ArgumentParser(description='SQLite 免登录单机版')
     parser.add_argument('--config', type=Path, default=ROOT / 'env/standalone/application.yml')
     parser.add_argument('--migrate-only', action='store_true', help='按数据库配置准备数据，不启动服务')
