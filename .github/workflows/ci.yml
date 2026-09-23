@@ -27,7 +27,7 @@ jobs:
         run: python -m unittest discover -s test -p 'test_*.py'
       - name: Windows deployment and API tests
         if: runner.os == 'Windows'
-        run: python scripts/ci_tests.py test_auto_deploy.py test_install_sources.py test_preflight.py test_log_queries.py test_progress.py test_task_control.py test_storage.py test_scanning.py test_network_recovery.py test_directory_scanner.py
+        run: python scripts/ci_tests.py test_auto_deploy.py test_install_sources.py test_preflight.py test_log_queries.py test_progress.py test_task_control.py test_storage.py test_scanning.py test_network_recovery.py test_directory_scanner.py test_asset_cache.py
       - name: Isolated application smoke test
         run: python scripts/smoke_test.py
       - name: Windows launch script preparation

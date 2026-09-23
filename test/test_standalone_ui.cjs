@@ -32,6 +32,8 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   // 延迟初始目录响应，验证它不会覆盖随后输入的新地址。
   await page.route('**/api/directories?*',async route=>{if(!new URL(route.request().url()).searchParams.get('path'))await delay(250);await route.continue()});
   console.log('检查列表与菜单');await page.goto(base);await page.waitForFunction(()=>document.querySelector('#taskCount').textContent==='11');
+  assert((await page.locator('#connection').textContent()).includes('本机已连接'));
+  assert(!((await page.locator('script[src]').getAttribute('src')).includes('reports-20260920')));
   assert.equal(await page.locator('#tasks tr').count(),10);
   await page.locator('#taskPager').getByRole('button',{name:'下一页'}).click();assert.equal(await page.locator('#tasks tr').count(),1);
   await page.locator('#taskSearch').fill('归档任务 03');assert.equal(await page.locator('#tasks tr').count(),1);

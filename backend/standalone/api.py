@@ -1,6 +1,7 @@
 """免登录本机 API：任务持久化、独立后台线程、运行日志分页。"""
 from __future__ import annotations
 import json
+import hashlib
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 from .engine import roots, synchronize
@@ -155,7 +156,10 @@ def create_app(database):
             return JSONResponse({'detail': '拒绝跨站请求'}, status_code=403)
         if request.method not in {'GET', 'HEAD'} and request.headers.get('x-sync-local') != '1':
             return JSONResponse({'detail': '缺少本机请求标识'}, status_code=403)
-        return await call_next(request)
+        response = await call_next(request)
+        # 本机管理页及接口不能沿用升级前缓存，避免旧脚本误判接口版本。
+        response.headers['Cache-Control'] = 'no-store'
+        return response
 
     def validate_paths(source, target):
         src, dst = roots(source, target)
@@ -201,7 +205,12 @@ def create_app(database):
 
     @app.get('/')
     def index():
-        return FileResponse(Path(__file__).with_name('index.html'))
+        directory = Path(__file__).parent
+        html = (directory / 'index.html').read_text(encoding='utf-8')
+        for name in ('app.js', 'app.css'):
+            fingerprint = hashlib.sha256((directory / 'assets' / name).read_bytes()).hexdigest()[:16]
+            html = html.replace('/assets/' + name + '?v=__ASSET_VERSION__', '/assets/' + name + '?v=' + fingerprint)
+        return HTMLResponse(html)
 
     @app.get('/api/health')
     def health():

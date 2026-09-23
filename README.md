@@ -1,6 +1,6 @@
 # File Sync · 单机文件同步
 
-当前源码版本 **0.1.7**。通过本机网页管理本地目录和已挂载网络共享的同步任务，支持 Windows、macOS、Linux 的 Python 运行环境。
+当前源码版本 **0.1.8**。通过本机网页管理本地目录和已挂载网络共享的同步任务，支持 Windows、macOS、Linux 的 Python 运行环境。
 
 免登录、SQLite 存储、无需单独启动前端。无需 MySQL、Redis、RabbitMQ、Node.js、rsync 或 WSL。此仓库只提供单机程序，不包含多机调度服务器。
 

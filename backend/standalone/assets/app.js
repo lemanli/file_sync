@@ -11,7 +11,7 @@ const activeRun=run=>run&&['running','pausing','paused','retry_wait'].includes(r
 async function controlRun(run,action){try{await api(`/runs/${run.id}/${action}`,'POST',{});await refresh(true)}catch(error){report(error)}}
 async function api(path,method='GET',body){
  if(method!=='GET'&&!state.backendReady)throw Error('后台尚未通过版本检查。请先停止旧单机程序并重新启动，再刷新页面；当前配置未提交。');
- const response=await fetch('/api'+path,{method,headers:{'Content-Type':'application/json','X-Sync-Local':'1'},body:body===undefined?undefined:JSON.stringify(body)});
+ const response=await fetch('/api'+path,{method,cache:'no-store',headers:{'Content-Type':'application/json','X-Sync-Local':'1'},body:body===undefined?undefined:JSON.stringify(body)});
  const data=await response.json();
  if(!response.ok){const detail=data.detail;throw Error(typeof detail==='string'?detail:Array.isArray(detail)?detail.map(x=>`${x.loc.slice(1).join('.')}: ${x.msg}`).join('；'):'请求失败，请重试')}
  return data;
@@ -141,7 +141,7 @@ async function refresh(manual=false){
   state.backendReady=health.configSchemaVersion===3&&health.taskControlVersion===1&&health.networkRecoveryVersion===1&&health.scanArchitectureVersion===1&&health.comparisonDetailsVersion===1&&health.timeOptionsVersion===1&&health.progressVersion===1&&health.logQueryVersion===1;
   const changed=JSON.stringify(tasks)!==JSON.stringify(state.tasks)||JSON.stringify(runs)!==JSON.stringify(state.runs)||!state.loaded;
   state.tasks=tasks;state.runs=runs;state.loaded=true;el('connection').textContent=state.backendReady?'● 本机已连接':'○ 后台版本过旧，请重启';if(['connection','compatibility'].includes(el('message').dataset.kind))el('message').hidden=true;
-  if(!state.backendReady){message('网页已更新，但后台仍是旧版本。请先停止旧单机程序并重新启动，再刷新页面；保存和运行已暂停，避免新配置被旧后台忽略。',true);el('message').dataset.kind='compatibility'}
+  if(!state.backendReady){message(`网页与后台接口不兼容（后台 ${health.releaseVersion||'未标识版本'}，配置接口 ${health.configSchemaVersion??'未知'}）。请先刷新网页；仍不匹配时再重启单机程序。保存和运行已暂停，避免配置丢失。`,true);el('message').dataset.kind='compatibility'}
   lastProgressRefresh=Date.now();progressDisconnected=false;renderProgress(el('liveProgress'),runs.find(r=>activeRun(r)));progressFreshness();
   if(changed||manual){state.tasksNeedRender=true;state.runsNeedRender=true}
   if(state.tasksNeedRender&&!document.querySelector('.row-menu[open]')&&(!el('tasks').contains(document.activeElement)||manual)){renderTasks();state.tasksNeedRender=false}
