@@ -100,3 +100,13 @@ Windows 将解释器路径换成 .venv-standalone/Scripts/python.exe。部分路
 ## 许可证
 
 保留本仓库原有 [MIT License](LICENSE)。
+
+自定义 Python（如 `E:\python`）及免 venv 安装：在 `env/install.ini` 设置 `[runtime]` 的 `python` 路径和 `environment = direct`，详见 [安装说明](docs/INSTALL.md#选择-python-与安装方式)。
+
+固定数据目录与自动迁移：在 `env/standalone/application.yml` 设置 `database.directory`，可选填写旧库目录 `database.migrate_from`，再双击启动；只准备数据可双击 `migrate-data.cmd`。本机多个版本轮流复用同一数据目录，关终端后的未结束记录自动标为中断。
+
+## 0.1.7 扫描策略
+
+已有任务默认保持 AUTO。普通单向同步可在编辑页选择“按目录比较大小和时间”，启用目录批量枚举和比较；只需覆盖复制选择 COPY_ALL，只补缺失文件选择 SKIP_EXISTING。镜像策略包含成功后安全删除。单向不建立持久索引。
+
+详见 [当前扫描分析](CURRENT_SCAN_ANALYSIS.md)、[改造与基准结果](SCAN_OPTIMIZATION_RESULT.md)。Windows 原生 A/B 可选；自动模式默认 scandir，待真实 SMB 基准后再选择。

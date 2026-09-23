@@ -4,6 +4,7 @@ import stat
 import time
 from pathlib import Path
 from .rules import IgnoreRules
+from .recovery import network_error, NetworkUnavailable
 from .comparison import compare, metadata, method_name, tolerance_ns
 
 
@@ -33,9 +34,12 @@ def synchronize_two_way(config, emit):
     identities = {p: (p.stat().st_dev,p.stat().st_ino) for p in (left,right) if p.exists()}
     def check_roots():
         for path, identity in identities.items():
-            if path.is_symlink() or not path.is_dir() or (path.stat().st_dev,path.stat().st_ino) != identity:
+            info = path.stat()
+            if path.is_symlink() or not stat.S_ISDIR(info.st_mode) or (info.st_dev,info.st_ino) != identity:
                 raise RuntimeError(f'双向同步根目录已失效或被替换：{path}')
     def failure(relative, error, side):
+        if config.get('continueOnError') and network_error(error):
+            raise NetworkUnavailable(str(error)) from error
         blocked.add(relative)
         totals['failed'] += 1
         emit(dict(action='failed',path=str(relative),error=str(error),bytes=0,direction=side))
@@ -51,6 +55,8 @@ def synchronize_two_way(config, emit):
             failure(Path(error.filename).relative_to(root), error, side)
         for base, directories, files in os.walk(root, onerror=scan_error):
             for name in directories + files:
+                if config.get('_control'):
+                    config['_control'].checkpoint()
                 progress('scan')
                 entry = Path(base)/name
                 relative = entry.relative_to(root)
@@ -92,6 +98,8 @@ def synchronize_two_way(config, emit):
         emit(dict(action='conflict',path=str(path),bytes=0,reason=reason,direction='both',comparison=comparison))
     # 父目录先处理，类型冲突时整个子树都不能被后续计划覆盖。
     for relative in sorted(a.keys() | b.keys(), key=lambda p:(len(p.parts),str(p))):
+        if config.get('_control'):
+            config['_control'].checkpoint()
         if is_blocked(relative):
             continue
         x,y = a.get(relative),b.get(relative)

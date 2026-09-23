@@ -2,9 +2,10 @@
 import os
 import tempfile
 from pathlib import Path
+from .recovery import network_error
 
 
-def check_destination(path, dry_run=False):
+def check_destination(path, dry_run=False, read_directory=True):
     destination = Path(path)
     probe_dir = destination
     # 未创建的目标检查最近存在父目录，不提前创建正式目录树。
@@ -12,7 +13,9 @@ def check_destination(path, dry_run=False):
         try:
             probe_dir.stat()
             break
-        except FileNotFoundError:
+        except FileNotFoundError as error:
+            if network_error(error):
+                raise ValueError(f'目标连接不可用：{destination}；{error}') from error
             if probe_dir == probe_dir.parent:
                 raise ValueError(f'目标没有可访问的父目录：{destination}')
             probe_dir = probe_dir.parent
@@ -23,8 +26,9 @@ def check_destination(path, dry_run=False):
     if any(p.is_symlink() for p in (probe_dir, *probe_dir.parents)):
         raise ValueError(f'目标路径包含符号链接：{probe_dir}')
     try:
-        with os.scandir(probe_dir) as entries:
-            next(entries, None)
+        if read_directory:
+            with os.scandir(probe_dir) as entries:
+                next(entries, None)
     except OSError as error:
         raise ValueError(f'目标目录不可读取：{probe_dir}；{error}') from error
     if dry_run:

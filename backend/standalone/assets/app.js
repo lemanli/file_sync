@@ -3,10 +3,12 @@
 const el=id=>document.getElementById(id);
 const form=el('form');
 const state={backendReady:false,tab:'tasks',tasks:[],runs:[],taskPage:1,runPage:1,taskFilter:null,editing:null,dirty:false,loaded:false,busy:false,runPending:false,logRun:null,logRows:[],logPage:1,logTotal:0,logPages:1,logRequest:0};
-const names={running:'执行中',partial:'部分完成',preview_partial:'演练有问题',success:'成功',preview:'演练完成',failed:'失败',interrupted:'已中断'};
-const actions={preflight:'目标权限检查',ignored:'规则忽略',conflict:'文件冲突',deletion_skipped:'已暂停删除',mapping_started:'目录组开始',mapping_completed:'目录组完成',mapping_failed:'目录组失败',copied:'复制',skipped:'跳过',deleted:'删除',failed:'文件失败'};
-const defaults={name:'',direction:'one_way',conflictPolicy:'skip',ignorePatterns:[],continueOnError:false,parallelism:4,batchFiles:100,largeThresholdMb:512,bandwidthLimit:0,maxRetries:2,retryInterval:1,comparisonMode:'size',preserveTime:true,timeToleranceSeconds:2,skipUnsupported:true,updateOnly:false,delete:false};
+const names={retry_wait:'等待网络重试',pausing:'正在暂停',paused:'已暂停',running:'执行中',partial:'部分完成',preview_partial:'演练有问题',success:'成功',preview:'演练完成',failed:'失败',interrupted:'已中断'};
+const actions={network_retry:'网络等待重试',network_retry_exhausted:'网络重试用尽',control:'执行控制',config_updated:'参数修改',preflight:'目标权限检查',ignored:'规则忽略',conflict:'文件冲突',deletion_skipped:'已暂停删除',mapping_started:'目录组开始',mapping_completed:'目录组完成',mapping_failed:'目录组失败',copied:'复制',skipped:'跳过',deleted:'删除',failed:'文件失败'};
+const defaults={name:'',syncStrategy:'AUTO',scanWorkers:1,scannerBackend:'auto',direction:'one_way',conflictPolicy:'skip',ignorePatterns:[],continueOnError:false,networkRetryCount:3,networkRetryMinutes:3,parallelism:4,batchFiles:100,largeThresholdMb:512,bandwidthLimit:0,maxRetries:2,retryInterval:1,comparisonMode:'size',preserveTime:true,timeToleranceSeconds:2,skipUnsupported:true,updateOnly:false,delete:false};
 const pageSize=10;
+const activeRun=run=>run&&['running','pausing','paused','retry_wait'].includes(run.status);
+async function controlRun(run,action){try{await api(`/runs/${run.id}/${action}`,'POST',{});await refresh(true)}catch(error){report(error)}}
 async function api(path,method='GET',body){
  if(method!=='GET'&&!state.backendReady)throw Error('后台尚未通过版本检查。请先停止旧单机程序并重新启动，再刷新页面；当前配置未提交。');
  const response=await fetch('/api'+path,{method,headers:{'Content-Type':'application/json','X-Sync-Local':'1'},body:body===undefined?undefined:JSON.stringify(body)});
@@ -22,7 +24,7 @@ function button(parent,text,fn,className=''){const b=node('button',text,classNam
 function parse(value,fallback={}){try{return JSON.parse(value)||fallback}catch{return fallback}}
 function mappingsOf(task){return task.pathMappings||[{source:task.source,target:task.target}]}
 function comparisonMode(config){return config.comparisonMode||(config.checksum?'sha256':'size_mtime')}
-function comparisonLabel(config){return {size:'仅文件大小',size_mtime:'大小＋修改时间',sha256:'SHA-256 内容比较＋复制校验'}[comparisonMode(config)]}
+function comparisonLabel(config){if(config.syncStrategy&&config.syncStrategy!=='AUTO')return {COPY_ALL:'全部覆盖',SKIP_EXISTING:'跳过已有名称',COMPARE_METADATA:'按目录比较大小＋时间',MIRROR:'镜像：大小＋时间及安全删除'}[config.syncStrategy];return {COPY_ALL:'全部覆盖',SKIP_EXISTING:'跳过已有名称',COMPARE_METADATA:'按目录比较大小＋时间',MIRROR:'镜像：大小＋时间',size:'仅文件大小',size_mtime:'大小＋修改时间',sha256:'SHA-256 内容比较＋复制校验'}[comparisonMode(config)]}
 function taskName(run){return parse(run.snapshot).name||state.tasks.find(t=>t.id===run.task_id)?.name||'已删除任务'}
 function date(value){return value?new Date(value).toLocaleString('zh-CN',{hour12:false}):'—'}
 function bytes(value){if(!value)return '0 B';const units=['B','KiB','MiB','GiB','TiB'];const i=Math.min(Math.floor(Math.log(value)/Math.log(1024)),4);return `${(value/1024**i).toFixed(i?1:0)} ${units[i]}`}
@@ -63,10 +65,11 @@ function renderTasks(){
   const rules=cell(row);rules.append(node('span',task.direction==='bidirectional'?'双向合并 · 不传播删除':task.delete?'单向镜像 · 删除多余文件':'单向增量 · 保留多余文件'));rules.append(node('span',[comparisonLabel(task),task.direction==='bidirectional'?(task.conflictPolicy==='newer'?'较新覆盖':'保留冲突'):task.updateOnly?'保护较新文件':'允许覆盖'].join(' · '),'cell-sub'));
   const recent=state.runs.find(r=>r.task_id===task.id);const status=cell(row);status.append(badge(recent?.status));if(recent)status.append(node('span',date(recent.started),'cell-sub'));
   const ops=node('div',undefined,'row-actions');cell(row).append(ops);if(recent)button(ops,'最近报告',()=>openLogs(recent),'link');
-  button(ops,'运行',()=>runTask(task,false),'link').disabled=state.runPending||state.runs.some(r=>r.status==='running');
+  if(activeRun(recent))button(ops,recent.status==='paused'?'恢复':'暂停',()=>controlRun(recent,recent.status==='paused'?'resume':'pause'),'link').disabled=recent.status==='pausing';
+  button(ops,'运行',()=>runTask(task,false),'link').disabled=state.runPending||state.runs.some(r=>activeRun(r));
   const menu=node('details',undefined,'row-menu');const summary=node('summary','更多 ▾');summary.setAttribute('aria-label',`${task.name}的更多操作`);menu.append(summary);const items=node('div',undefined,'menu-items');menu.append(items);
   for(const [label,fn] of [['编辑任务',()=>startEditor(task)],['演练',()=>runTask(task,true)],['复制配置',()=>startEditor(task,true)],['执行记录',()=>{state.taskFilter=task.id;state.runPage=1;el('runSearch').value='';el('runStatus').value='';showTab('runs');renderRuns()}],['删除任务',()=>deleteTask(task)]]){
-   const b=button(items,label,()=>{menu.open=false;return fn()},label==='删除任务'?'danger':'');if(label==='演练')b.disabled=state.runPending||state.runs.some(r=>r.status==='running');
+   const b=button(items,label,()=>{menu.open=false;return fn()},label==='删除任务'?'danger':'');if(label==='演练')b.disabled=state.runPending||state.runs.some(r=>activeRun(r));
   }
   menu.addEventListener('toggle',()=>{if(menu.open)for(const other of document.querySelectorAll('.row-menu[open]'))if(other!==menu)other.open=false});ops.append(menu);
  }
@@ -83,10 +86,12 @@ function progressFreshness(failed=false){
  if(status)status.textContent=stale?`状态更新中断 · 距上次响应 ${age} 秒；显示的是上次快照`:'● 状态已刷新 · '+new Date(lastProgressRefresh).toLocaleTimeString('zh-CN',{hour12:false});
 }
 function renderProgress(box,run){
- box.replaceChildren();box.hidden=!run||run.status!=='running';if(box.hidden)return;
+ box.replaceChildren();box.hidden=!activeRun(run);if(box.hidden)return;
+ if(run.status==='paused'){box.append(node('strong',run.recovery?.requiresResume?'网络重试已用尽，等待管理员恢复':'已暂停'),node('p',run.recovery?.error||'已有文件已完成处理，可编辑参数或追加目录组，恢复后继续。'));button(box,'恢复任务',()=>controlRun(run,'resume'));return}
+ if(run.status==='retry_wait'){const r=run.recovery||{};box.append(node('strong',`等待网络重试 · 第 ${r.attempt??0}/${r.limit??0} 次`),node('p',r.error||'存储连接暂不可用'),node('p',`约 ${Math.max(0,Math.ceil((r.nextRetryAt||0)-Date.now()/1000))} 秒后重试；当前组会重新比较，已完成文件按规则跳过。`));button(box,'立即重试',()=>controlRun(run,'resume'));return}
  const p=run.progress;if(!p){box.append(node('strong','等待后台开始处理…'));return}
  const dry=parse(run.snapshot).dryRun;
- const heading=node('div',undefined,'activity-heading');const spinner=node('span',undefined,'activity-spinner');spinner.setAttribute('aria-hidden','true');heading.append(spinner,node('strong','正在运行 · '+taskName(run)),node('span','', 'activity-freshness'));box.append(heading);
+ const heading=node('div',undefined,'activity-heading');const spinner=node('span',undefined,'activity-spinner');spinner.setAttribute('aria-hidden','true');heading.append(spinner,node('strong',(run.status==='pausing'?'正在暂停，等待当前文件完成 · ':'正在运行 · ')+taskName(run)),node('span','', 'activity-freshness'));box.append(heading);
  const stage=['queued','checking','scanning','planning'].includes(p.phase)?0:p.phase==='finalizing'?2:1;
  const steps=node('div',undefined,'activity-stages');
  for(const [i,label] of ['扫描 / 规划','比较 / 复制 / 校验','清理 / 收尾'].entries()){const item=node('span',label,i===stage?'current':i<stage?'passed':'');if(i===stage)item.setAttribute('aria-current','step');steps.append(item)}
@@ -94,6 +99,7 @@ function renderProgress(box,run){
  const flow=node('div',undefined,'activity-flow');flow.setAttribute('aria-hidden','true');flow.append(node('span'));box.append(flow);
  box.append(node('strong',taskName(run)+' · '+(dry?'演练 · ':'')+(phaseNames[p.phase]||p.phase)));
  box.append(node('p',`目录组 ${p.mappingIndex}/${p.mappingCount} · 已检查 ${p.scannedEntries} 个条目 · 已运行 ${Math.floor(p.elapsedSeconds)} 秒`));
+ if(p.phase==='scanning'||p.phase==='planning'){box.append(node('p',`扫描 ${(p.scanEntriesPerSecond??0).toFixed(0)} 条目/秒 · ${p.scanSide==='target'?'目标端':p.scanSide==='source'?'源端':'两端规划'}`));if(p.scanPath)box.append(node('p',p.scanPath,'active-path'))}
  const c=p.counts;
  box.append(node('p',`${dry?'预计':''}复制 ${c.copied} · 跳过 ${c.skipped} · 失败 ${c.failed} · 冲突 ${c.conflicts} · 忽略 ${c.ignored} · 删除 ${c.deleted}`));
  box.append(node('p',`近期处理 ${p.filesPerSecond.toFixed(1)} 文件/秒 · 写入 ${bytes(p.bytesPerSecond)}/秒 · 累计写入 ${bytes(p.writtenBytes)}`));
@@ -108,6 +114,7 @@ function renderProgress(box,run){
   if(file.phase==='copying'&&file.size>0){const bar=node('progress');bar.max=file.size;bar.value=Math.min(file.written,file.size);bar.setAttribute('aria-label','当前文件写入进度');item.append(node('span',`${bytes(file.written)} / ${bytes(file.size)}（${Math.min(100,file.written/file.size*100).toFixed(1)}%）`),bar)}
   box.append(item);
  }
+ if(p.scanMetrics&&Object.keys(p.scanMetrics).length){const m=p.scanMetrics;box.append(node('p',`源 ${Number(p.sourceScanRate??0).toFixed(0)} / 目标 ${Number(p.targetScanRate??0).toFixed(0)} 条目/秒 · ${Number(p.directoriesPerSecond??0).toFixed(1)} 目录/秒（自启动均值）`),node('p',`扫描队列 ${m.directoryQueueLength??0} · 复制排队上限估计 ${m.copyQueueLength??0} · 显式属性读取 ${m.metadataCalls??0} · 原生枚举调用 ${m.nativeCalls??0} · 回退 ${m.fallbacks??0}`));}
  if(p.activeFiles.length>4)box.append(node('span',`另有 ${p.activeFiles.length-4} 个文件正在处理`,'muted'));
  box.append(node('small','每 2 秒刷新；动画仅表示运行状态，实际进展以计数和路径为准。计数随处理批次更新。写入速率包含重试，不含哈希读取；文件写完仍需校验和替换。'));
 }
@@ -121,7 +128,7 @@ function renderRuns(){
   const row=body.insertRow();const title=cell(row);title.append(node('span',taskName(run),'task-name'),node('span',date(run.started),'cell-sub'));
   cell(row).append(badge(run.status));const result=parse(run.result);const summary=cell(row);
   if(run.error){summary.append(node('span',run.error,'truncate'));summary.firstChild.title=run.error}
-  else if(run.status==='running')summary.textContent=run.progress?`${phaseNames[run.progress.phase]||run.progress.phase} · 已处理 ${run.progress.finished} 个文件`:'等待后台开始处理';
+  else if(activeRun(run))summary.textContent=run.progress?`${phaseNames[run.progress.phase]||run.progress.phase} · 已处理 ${run.progress.finished} 个文件`:'等待后台开始处理';
   else{summary.textContent=`${result.dryRun?'预计':''}复制 ${result.copied??0} · 跳过 ${result.skipped??0} · 删除 ${result.deleted??0}`;if(result.failed||result.conflicts)summary.append(node('span',`失败 ${result.failed||0} · 冲突 ${result.conflicts||0}`,'cell-sub'));if(result.ignored)summary.append(node('span',`规则忽略 ${result.ignored} 项`,'cell-sub'));if(result.unsupportedSkipped)summary.append(node('span',`已排除 ${result.unsupportedSkipped} 个链接或特殊文件`,'cell-sub'));summary.append(node('span',`${bytes(result.bytes)} · ${result.mappings?.length??1} 组目录`,'cell-sub'))}
   summary.append(node('span','比较方式：'+comparisonLabel(parse(run.snapshot)),'cell-sub'));
   cell(row,result.durationSeconds!=null?`${Number(result.durationSeconds).toFixed(2)} 秒`:'—');const ops=cell(row);button(ops,'查看报告',()=>openLogs(run),'link');button(ops,'查看日志',()=>openLogs(run),'link');if(run.status==='failed'||run.status==='partial'){const task=state.tasks.find(t=>t.id===run.task_id);if(task)button(ops,'修改任务规则',()=>{startEditor(task);form.elements.skipUnsupported.scrollIntoView({block:'center'});form.elements.skipUnsupported.focus();if((run.error||'').includes('符号链接'))message('本次失败发生在文件比较之前。若不需要备份链接，请勾选跳过后保存；需要完整保留链接时请勿跳过。',true)},'link')}
@@ -131,11 +138,11 @@ async function refresh(manual=false){
  if(state.busy)return;state.busy=true;
  try{
   const [tasks,runs,health]=await Promise.all([api('/tasks'),api('/runs'),api('/health')]);
-  state.backendReady=health.configSchemaVersion===2&&health.comparisonDetailsVersion===1&&health.timeOptionsVersion===1&&health.progressVersion===1&&health.logQueryVersion===1;
+  state.backendReady=health.configSchemaVersion===3&&health.taskControlVersion===1&&health.networkRecoveryVersion===1&&health.scanArchitectureVersion===1&&health.comparisonDetailsVersion===1&&health.timeOptionsVersion===1&&health.progressVersion===1&&health.logQueryVersion===1;
   const changed=JSON.stringify(tasks)!==JSON.stringify(state.tasks)||JSON.stringify(runs)!==JSON.stringify(state.runs)||!state.loaded;
   state.tasks=tasks;state.runs=runs;state.loaded=true;el('connection').textContent=state.backendReady?'● 本机已连接':'○ 后台版本过旧，请重启';if(['connection','compatibility'].includes(el('message').dataset.kind))el('message').hidden=true;
   if(!state.backendReady){message('网页已更新，但后台仍是旧版本。请先停止旧单机程序并重新启动，再刷新页面；保存和运行已暂停，避免新配置被旧后台忽略。',true);el('message').dataset.kind='compatibility'}
-  lastProgressRefresh=Date.now();progressDisconnected=false;renderProgress(el('liveProgress'),runs.find(r=>r.status==='running'));progressFreshness();
+  lastProgressRefresh=Date.now();progressDisconnected=false;renderProgress(el('liveProgress'),runs.find(r=>activeRun(r)));progressFreshness();
   if(changed||manual){state.tasksNeedRender=true;state.runsNeedRender=true}
   if(state.tasksNeedRender&&!document.querySelector('.row-menu[open]')&&(!el('tasks').contains(document.activeElement)||manual)){renderTasks();state.tasksNeedRender=false}
   if(state.runsNeedRender&&(!el('runs').contains(document.activeElement)||manual)){renderRuns();state.runsNeedRender=false}
@@ -157,21 +164,36 @@ function addMapping(mapping={}){
  button(heading,'移除',()=>{if(el('mappings').children.length===1){report(Error('至少保留一组目录'));return}row.remove();state.dirty=true;[...el('mappings').children].forEach((r,i)=>r.querySelector('strong').textContent=`目录组 ${i+1}`)},'link danger');row.append(heading);
  const fields=node('div',undefined,'mapping-fields');
  for(const [key,title] of [['source','源目录'],['target','目标目录']]){const label=node('label',title);const entry=node('div',undefined,'path-entry');const input=node('input');input.dataset.path=key;input.required=true;input.value=mapping[key]||'';input.placeholder=key==='source'?'选择或输入完整目录路径':'选择或输入目标目录';entry.append(input);button(entry,'浏览',()=>openBrowser(input,title));label.append(entry);fields.append(label)}
- row.append(fields);el('mappings').append(row);
+ row.append(fields);
+ const option=node('label',undefined,'check');const include=node('input');include.type='checkbox';include.dataset.includeSourceName='1';include.checked=!!mapping.includeSourceName;option.append(include,node('span','包含源目录名（在目标下创建同名目录）'));row.append(option);
+ const preview=node('p',undefined,'muted');row.append(preview);
+ const updatePreview=()=>{const source=row.querySelector('[data-path=source]').value.replace(/[\\/]+$/,'');const target=row.querySelector('[data-path=target]').value;const name=source.split(/[\\/]/).pop();const separator=target.includes('\\')?'\\':'/';preview.textContent='实际目标：'+(include.checked&&name?target.replace(/[\\/]+$/,'')+separator+name:target)};
+ row.addEventListener('input',updatePreview);row.addEventListener('change',updatePreview);updatePreview();el('mappings').append(row);
 }
 function startEditor(task=null,copy=false){
  if(!leaveEditor())return;
- state.editing=copy?null:task?.id??null;state.dirty=false;form.reset();const values={...defaults,...task};if(task){values.comparisonMode=comparisonMode(task);values.timeToleranceSeconds=task.timeToleranceSeconds??0}
+ state.editing=copy?null:task?.id??null;state.dirty=false;for(const input of form.querySelectorAll('input,select,textarea,button'))input.disabled=false;form.reset();const values={...defaults,...task};if(task){values.comparisonMode=comparisonMode(task);values.timeToleranceSeconds=task.timeToleranceSeconds??0}
  for(const input of form.querySelectorAll('input[name],select[name],textarea[name]')){if(input.type==='checkbox')input.checked=!!values[input.name];else input.value=input.name==='ignorePatterns'?(values.ignorePatterns||[]).join('\n'):(values[input.name]??defaults[input.name])}
  if(copy)form.elements.name.value=`${task.name}（副本）`.slice(0,128);
  updateDirection();el('mappings').replaceChildren();(task?mappingsOf(task):[{}]).forEach(addMapping);
- el('editorTitle').textContent=copy?'复制任务配置':task?'编辑任务':'新建任务';el('editing').textContent=task&&!copy?'修改后请保存，后续运行才会使用新配置':'尚未保存';el('tab-editor').hidden=false;showTab('editor',true);state.dirty=copy;form.elements.name.focus();
+ const current=!copy&&task?state.runs.find(r=>r.task_id===task.id&&activeRun(r)):null;
+ if(current){
+  const editable=['name','bandwidthLimit','maxRetries','retryInterval','continueOnError','parallelism','batchFiles','largeThresholdMb','networkRetryCount','networkRetryMinutes'];
+  for(const input of form.querySelectorAll('[name]'))input.disabled=current.status!=='paused'||!editable.includes(input.name);
+  for(const input of el('mappings').querySelectorAll('input,button'))input.disabled=true;
+  el('addMapping').disabled=current.status!=='paused';el('applyPreset').disabled=true;el('rulePreset').disabled=true;
+  el('saveTask').disabled=current.status!=='paused';
+ }
+
+ if(!current)updateScanStrategy();
+ el('editorTitle').textContent=copy?'复制任务配置':task?'编辑任务':'新建任务';el('editing').textContent=task&&!copy?'修改后请保存，后续运行才会使用新配置':'尚未保存';el('tab-editor').hidden=false;showTab('editor',true);state.dirty=copy;if(current)message(current.status==='paused'?'暂停编辑：已有目录已锁定，可追加目录组。限速和重试从后续文件生效，并发及批量参数从下一目录组生效。':'请先暂停并等待当前文件完成后编辑。');form.elements.name.focus();
 }
 form.oninput=()=>{state.dirty=true};
 form.onsubmit=async event=>{
  event.preventDefault();el('saveTask').disabled=true;
  try{const data={};for(const input of form.querySelectorAll('input[name],select[name],textarea[name]'))data[input.name]=input.type==='checkbox'?input.checked:input.type==='number'?Number(input.value):input.name==='ignorePatterns'?input.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean):input.value;
- data.pathMappings=[...el('mappings').children].map(row=>({source:row.querySelector('[data-path=source]').value,target:row.querySelector('[data-path=target]').value}));
+ data.pathMappings=[...el('mappings').children].map(row=>({source:row.querySelector('[data-path=source]').value,target:row.querySelector('[data-path=target]').value,includeSourceName:row.querySelector('[data-include-source-name]').checked}));
+ if(data.syncStrategy!=='AUTO'){data.direction='one_way';data.updateOnly=false;data.delete=data.syncStrategy==='MIRROR';data.comparisonMode='size_mtime'}
  data.checksum=data.comparisonMode==='sha256';
  if(data.checksum&&!confirm('内容哈希会读取完整文件，确认启用？'))return;
  await api(state.editing?`/tasks/${state.editing}`:'/tasks',state.editing?'PUT':'POST',data);state.dirty=false;state.editing=null;el('tab-editor').hidden=true;showTab('tasks',true);message('任务已保存，可直接运行；如需预览变化，可从“更多”选择演练。');await refresh(true);
@@ -204,7 +226,9 @@ async function loadReport(runId){
  box.append(metrics,node('small',report.partial?'任务运行中：以上为已落库记录，刷新结果可更新；未提交批次暂不计入。':'点击任一数量查看对应文件。跳过包括被排除的链接，规则忽略单独计数。'));
  if(['failed','interrupted'].includes(report.run.status))box.append(node('p','本次未正常完成：以上仅为已记录数量，可能不完整；请结合错误日志核查目标文件。','run-error'));
  box.append(node('small','报告更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false})));
- const duration=parse(report.run.result).durationSeconds;
+ const savedResult=parse(report.run.result);
+ for(const [index,mapping] of (savedResult.mappings||[]).entries()){const m=mapping.scanMetrics;if(m)box.append(node('p',`目录组 ${index+1}：源枚举 ${m.sourceEntries} / 目标枚举 ${m.targetEntries} 项；显式属性 API ${m.metadataCalls}，原生枚举 API ${m.nativeCalls}，回退 ${m.fallbacks} 次。`));}
+ const duration=savedResult.durationSeconds;
  if(duration!=null)box.append(node('p',`同步耗时：${Number(duration).toFixed(2)} 秒`));
 }
 async function openLogs(run){
@@ -232,6 +256,7 @@ function renderLogs(){
  for(const row of rows){const event=row.event,tr=body.insertRow();cell(tr,date(row.created));cell(tr).append(node('span',event.action==='copied'?(parse(state.logRun.snapshot).dryRun?'预计复制':'复制成功'):event.action==='deleted'&&parse(state.logRun.snapshot).dryRun?'预计删除':actions[event.action]||event.action||'事件','badge '+(String(event.action).includes('failed')?'failed':event.action==='conflict'?'partial':'')));
  const path=cell(tr);path.append(node('span',`目录组 ${event.mappingIndex??'—'}${event.direction==='source_to_target'?' · 源 → 目标':event.direction==='target_to_source'?' · 目标 → 源':event.direction==='both'?' · 两端比较':''}`,'cell-sub'),node('span',event.path||`${event.source||''} → ${event.target||''}`));
  const detail=cell(tr);detail.append(node('span',event.error||event.reason|| (event.action==='mapping_completed'?'本组处理完成':event.bytes!=null?`${bytes(event.bytes)}${event.retries?` · 重试 ${event.retries} 次`:''}`:'—')));
+ if(event.retryCount!=null)detail.append(node('span',`网络重试 ${event.retryCount}/${event.retryLimit} · ${event.waitSeconds==null?'次数已用尽，等待管理员恢复':event.waitSeconds+' 秒后重试'}`,'cell-sub'));
  if(event.comparison){const info=node('details',undefined,'log-detail comparison-detail');info.append(node('summary','查看大小 / 时间 / 哈希比较'));const lines=['比较方式：'+comparisonLabel({comparisonMode:event.comparison.method}), '判断：'+event.comparison.reason];for(const [key,label] of [['source','源文件'],['target','执行前目标文件']]){const item=event.comparison[key];lines.push(item?`${label}：${item.size} 字节；修改时间 ${date(Number(item.mtimeNs)/1e6)}；纳秒时间戳 ${item.mtimeNs}；SHA-256：${item.sha256||'未计算'}`:`${label}：不存在`)}lines.push('时间容差：'+(event.comparison.timeToleranceSeconds??0)+' 秒');if(event.timestamps)lines.push('复制后修改时间：'+date(Number(event.timestamps.targetMtimeNs)/1e6)+'；'+(event.timestamps.preserved?'保留源修改时间':'使用写入时间')+'；与源相差 '+Number(event.timestamps.differenceNs)/1e9+' 秒');if(event.verification)lines.push('写入后 SHA-256：'+event.verification.writtenSha256);info.append(node('pre',lines.join('\n')));detail.append(info)}
  const raw=node('details',undefined,'log-detail');raw.append(node('summary','原始详情'),node('pre',JSON.stringify(event,null,2)));detail.append(raw);
  }
@@ -286,15 +311,15 @@ el('folderUp').onclick=()=>{if(browseState?.parent)navigateFolder(browseState.pa
 el('folderMore').onclick=()=>{if(browseState?.nextOffset!=null)browse(browseState.path,browseState.nextOffset)};
 el('folderCancel').onclick=closeBrowser;
 el('folderDialog').oncancel=event=>{event.preventDefault();closeBrowser()};
-el('folderSelect').onclick=()=>{if(selectedInput&&browseState?.path){selectedInput.value=browseState.path;state.dirty=true;closeBrowser()}};
+el('folderSelect').onclick=()=>{if(selectedInput&&browseState?.path){selectedInput.value=browseState.path;selectedInput.dispatchEvent(new Event('input',{bubbles:true}));state.dirty=true;closeBrowser()}};
 refresh();setInterval(()=>{if(!document.hidden){progressFreshness();refresh()}},2000);
 
 // 预设仅填表，不立即保存或执行；旧任务缺少新字段时使用兼容默认值。
 const presets={
- incremental:{direction:'one_way',delete:false,updateOnly:false,comparisonMode:'size',preserveTime:true,timeToleranceSeconds:2,continueOnError:false,skipUnsupported:true,ignorePatterns:[],conflictPolicy:'skip'},
- mirror:{direction:'one_way',delete:true,updateOnly:false,comparisonMode:'size',preserveTime:true,timeToleranceSeconds:2,continueOnError:false,skipUnsupported:true,ignorePatterns:[],conflictPolicy:'skip'},
- merge:{direction:'bidirectional',delete:false,updateOnly:false,comparisonMode:'size',preserveTime:true,timeToleranceSeconds:2,continueOnError:false,skipUnsupported:true,ignorePatterns:[],conflictPolicy:'skip'},
- project:{direction:'one_way',delete:false,updateOnly:false,comparisonMode:'size',preserveTime:true,timeToleranceSeconds:2,continueOnError:true,skipUnsupported:true,ignorePatterns:['.git/','node_modules/','.venv/','__pycache__/','*.pyc','.DS_Store','Thumbs.db'],conflictPolicy:'skip'}
+ incremental:{syncStrategy:'AUTO',direction:'one_way',delete:false,updateOnly:false,comparisonMode:'size',preserveTime:true,timeToleranceSeconds:2,continueOnError:false,skipUnsupported:true,ignorePatterns:[],conflictPolicy:'skip'},
+ mirror:{syncStrategy:'AUTO',direction:'one_way',delete:true,updateOnly:false,comparisonMode:'size',preserveTime:true,timeToleranceSeconds:2,continueOnError:false,skipUnsupported:true,ignorePatterns:[],conflictPolicy:'skip'},
+ merge:{syncStrategy:'AUTO',direction:'bidirectional',delete:false,updateOnly:false,comparisonMode:'size',preserveTime:true,timeToleranceSeconds:2,continueOnError:false,skipUnsupported:true,ignorePatterns:[],conflictPolicy:'skip'},
+ project:{syncStrategy:'AUTO',direction:'one_way',delete:false,updateOnly:false,comparisonMode:'size',preserveTime:true,timeToleranceSeconds:2,continueOnError:true,skipUnsupported:true,ignorePatterns:['.git/','node_modules/','.venv/','__pycache__/','*.pyc','.DS_Store','Thumbs.db'],conflictPolicy:'skip'}
 };
 function updateDirection(){
  const twoWay=form.elements.direction.value==='bidirectional';
@@ -306,5 +331,16 @@ el('syncDirection').onchange=()=>{updateDirection();state.dirty=true};
 el('applyPreset').onclick=()=>{
  const preset=presets[el('rulePreset').value];
  for(const [key,value] of Object.entries(preset)){const field=form.elements[key];if(field.type==='checkbox')field.checked=value;else field.value=Array.isArray(value)?value.join('\n'):value}
- updateDirection();state.dirty=true;message('规则预设已填入，请检查后保存任务。');
+ updateScanStrategy();state.dirty=true;message('规则预设已填入，请检查后保存任务。');
 };
+
+// 保留现有任务编辑页；新策略的固定语义直接展示，避免保存时暗改选项。
+function updateScanStrategy(){
+ const strategy=form.elements.syncStrategy.value, explicit=strategy!=='AUTO';
+ if(explicit){form.elements.direction.value='one_way';form.elements.updateOnly.checked=false;form.elements.delete.checked=strategy==='MIRROR';form.elements.comparisonMode.value='size_mtime'}
+ updateDirection();
+ for(const name of ['direction','comparisonMode'])form.elements[name].disabled=explicit;
+ for(const name of ['updateOnly','delete'])form.elements[name].disabled=explicit||form.elements.direction.value==='bidirectional';
+ if(explicit)el('modeHint').textContent={COPY_ALL:'全部覆盖：仅扫描源；现有同名文件也会重新写入。',SKIP_EXISTING:'已有名称即跳过，不读取大小、时间或内容。',COMPARE_METADATA:'按目录比较大小和时间；相同则跳过，时间容差仍生效。',MIRROR:'镜像将删除目标多余内容；仅在复制和扫描无错误后执行删除。'}[strategy];
+}
+el('syncStrategy').addEventListener('change',updateScanStrategy);

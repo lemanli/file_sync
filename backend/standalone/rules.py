@@ -36,6 +36,8 @@ class IgnoreRules:
         self.patterns = [p.strip() for p in patterns if p.strip() and not p.strip().startswith('#')]
 
     def matches(self, relative, is_dir=False):
+        if not self.patterns:
+            return False
         value = PurePosixPath(relative.as_posix())
         # 文件位于被忽略目录内时也受保护，尤其用于目标端删除。
         candidates = [(value.as_posix(), is_dir)]

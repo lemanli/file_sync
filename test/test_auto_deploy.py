@@ -33,7 +33,7 @@ class AutoDeployTests(unittest.TestCase):
     def test_foreign_environment_preserved(self):
         (self.env/'keep').write_text('preserve')
         def create(path):path.mkdir()
-        with patch.object(deploy,'interpreter_ready',return_value=False),patch.object(deploy,'standalone_ready',return_value=True),patch.object(deploy.venv,'EnvBuilder') as builder:
+        with patch.object(deploy,'interpreter_ready',return_value=False),patch.object(deploy,'standalone_ready',return_value=True),patch('venv.EnvBuilder') as builder:
             builder.return_value.create.side_effect=create
             deploy.prepare_standalone(self.root)
         backup=list(self.root.glob('.venv-standalone.backup-*'))
@@ -49,7 +49,7 @@ class AutoDeployTests(unittest.TestCase):
     def test_default_entry_prepares_standalone(self):
         with patch.object(deploy.sys,'argv',['deploy.py','--prepare-only']),patch.object(deploy,'prepare_standalone',return_value=Path('python')) as prepare,patch.object(deploy.subprocess,'run') as run:
             deploy.main()
-            prepare.assert_called_once_with(deploy.ROOT,None);run.assert_not_called()
+            prepare.assert_called_once_with(deploy.ROOT,None,'venv');run.assert_not_called()
 
     def test_legacy_standalone_argument_still_works(self):
         with patch.object(deploy.sys,'argv',['deploy.py','standalone','--auto','--prepare-only']),patch.object(deploy,'prepare_standalone',return_value=Path('python')) as prepare:
@@ -61,3 +61,27 @@ class AutoDeployTests(unittest.TestCase):
         with patch.object(deploy.sys,'argv',['deploy.py','server']),patch.object(deploy,'prepare_standalone') as prepare,contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as error:deploy.main()
             self.assertEqual(error.exception.code,2);prepare.assert_not_called()
+
+    def test_direct_reuses_interpreter_without_environment_changes(self):
+        import sys
+        with patch.object(deploy, 'standalone_ready', return_value=True), patch('venv.EnvBuilder') as builder:
+            python = deploy.prepare_standalone(self.root, environment='direct')
+        self.assertEqual(python, Path(sys.executable))
+        builder.assert_not_called()
+        self.assertFalse((self.env / '.sync-requirements.sha256').exists())
+
+    def test_direct_install_uses_selected_pip_without_ensurepip(self):
+        with patch.object(deploy, 'standalone_ready', side_effect=[False, True, True]), patch.object(deploy.subprocess, 'run') as run:
+            run.return_value.returncode = 0
+            deploy.prepare_standalone(self.root, environment='direct')
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertTrue(any('install' in cmd for cmd in commands))
+        self.assertFalse(any('ensurepip' in cmd for cmd in commands))
+        self.assertTrue(all(cmd[0] == deploy.sys.executable for cmd in commands))
+
+    def test_runtime_config_and_override(self):
+        (self.root / 'env/install.ini').write_text('[runtime]\nenvironment=direct\npython=custom python\n')
+        with patch.dict(deploy.os.environ, {}, clear=True):
+            self.assertEqual(deploy.runtime_setting(self.root, 'environment'), 'direct')
+            self.assertEqual(deploy.runtime_setting(self.root, 'environment', 'venv'), 'venv')
+            self.assertEqual(deploy.configured_python(self.root, 'custom python'), self.root / 'custom python')

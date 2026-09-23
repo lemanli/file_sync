@@ -4,7 +4,7 @@ import json
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -20,6 +20,9 @@ from .comparison import method_name
 from . import __version__
 from .progress import Progress
 from .preflight import check_destination
+from .control import RunControl, RunInterrupted
+from .storage import interrupt_records
+from .recovery import network_error
 
 
 def now():
@@ -29,6 +32,7 @@ def now():
 class PathMapping(BaseModel):
     source: str = Field(min_length=1)
     target: str = Field(min_length=1)
+    includeSourceName: bool = False
 
 
 class Task(BaseModel):
@@ -49,14 +53,27 @@ class Task(BaseModel):
         if self.comparisonMode is None:
             self.comparisonMode = ('sha256' if self.checksum else 'size_mtime') if 'checksum' in self.model_fields_set else 'size'
         self.checksum = self.comparisonMode == 'sha256'
+        if self.syncStrategy != 'AUTO':
+            if self.direction == 'bidirectional':
+                raise ValueError('双向合并请使用兼容策略 AUTO')
+            if self.updateOnly or (self.delete and self.syncStrategy != 'MIRROR'):
+                raise ValueError('新策略不能组合仅更新或独立删除选项')
+            self.delete = self.syncStrategy == 'MIRROR'
+            self.comparisonMode = 'size_mtime'
+            self.checksum = False
         validate_patterns(self.ignorePatterns)
         if self.direction == 'bidirectional' and self.delete:
             raise ValueError('双向合并不支持删除，请关闭删除选项')
         return self
     direction: Literal['one_way', 'bidirectional'] = 'one_way'
+    syncStrategy: Literal['AUTO', 'COPY_ALL', 'SKIP_EXISTING', 'COMPARE_METADATA', 'MIRROR'] = 'AUTO'
+    scanWorkers: int = Field(default=1, ge=1, le=32)
+    scannerBackend: Literal['auto','portable','macos','linux','windows_bulk','windows_find'] = 'auto'
     conflictPolicy: Literal['skip', 'newer'] = 'skip'
     ignorePatterns: list[str] = Field(default_factory=list, max_length=200)
     continueOnError: bool = False
+    networkRetryCount: int = Field(default=3, ge=0, le=100)
+    networkRetryMinutes: float = Field(default=3, ge=.01, le=1440, allow_inf_nan=False)
     parallelism: int = Field(default=4, ge=1, le=32)
     batchFiles: int = Field(default=100, ge=1, le=1000)
     largeThresholdMb: int = Field(default=512, ge=1)
@@ -81,11 +98,19 @@ def create_app(database):
     database.parent.mkdir(parents=True, exist_ok=True)
     gate = threading.Lock()
     live = {}
+    controls = {}
     live_lock = threading.Lock()
     pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='sync-task')
 
+    # SQLite 3.51.0/3.51.1 Unix 打开/关闭锁序缺陷；仅这些版本串行短事务。
+    database_access = threading.RLock() if sqlite3.sqlite_version_info in ((3,51,0),(3,51,1)) else nullcontext()
+
     @contextmanager
     def connect():
+        with database_access:
+            yield from connect_unlocked()
+
+    def connect_unlocked():
         connection = sqlite3.connect(database, timeout=30)
         connection.row_factory = sqlite3.Row
         try:
@@ -106,12 +131,15 @@ def create_app(database):
             CREATE INDEX IF NOT EXISTS events_run ON events(run_id,id);
             CREATE INDEX IF NOT EXISTS events_run_action ON events(run_id,json_extract(detail,'$.action'),id);
         ''')
-        db.execute("UPDATE runs SET status='interrupted',ended=?,error='程序上次退出时任务未完成' WHERE status='running'", (now(),))
+        interrupt_records(db, '程序上次退出时任务未完成，已标为中断；重新运行将重新比较文件')
 
     @asynccontextmanager
     async def lifespan(app):
         yield
         # 等待正在写入的文件完成，避免进程退出时后台线程丢失最终状态。
+        with live_lock:
+            for control in controls.values():
+                control.close()
         pool.shutdown(wait=True)
 
     app = FastAPI(title='文件同步·单机版', version=__version__, lifespan=lifespan)
@@ -139,17 +167,31 @@ def create_app(database):
 
     def validate_task(config):
         task = Task.model_validate(config)
-        mappings = task.pathMappings
-        paths = [validate_paths(m.source, m.target) for m in mappings]
+        mappings = []
+        for item in task.pathMappings:
+            mapping = item.model_dump()
+            if item.includeSourceName:
+                name = Path(item.source).resolve().name
+                if not name:
+                    raise ValueError('源为文件系统根目录时无法包含目录名，请选择子目录')
+                mapping['configuredTarget'] = item.target
+                mapping['target'] = str(Path(item.target) / name)
+            mappings.append(mapping)
+        paths = [validate_paths(m['source'], m['target']) for m in mappings]
         def overlaps(a, b):
             return a == b or a in b.parents or b in a.parents
-        # 目标不得影响任何其他源，也不能与其他目标相互覆盖。
+        # 单向合并允许共享目标；删除和双向模式要求各组写入范围独立。
         for i, (src, dst) in enumerate(paths):
             for j, (other_src, other_dst) in enumerate(paths):
-                if i != j and (overlaps(dst, other_src) or overlaps(dst, other_dst)
-                               or (task.direction == 'bidirectional' and overlaps(src, other_src))):
-                    raise ValueError(f'第 {i+1} 组目标与第 {j+1} 组源或目标重叠')
-        return [m.model_dump() for m in mappings]
+                if i == j:
+                    continue
+                if overlaps(dst, other_src):
+                    raise ValueError(f'第 {i+1} 组实际目标与第 {j+1} 组源重叠，可能改写同步源')
+                if overlaps(dst, other_dst) and (task.delete or task.direction == 'bidirectional'):
+                    raise ValueError(f'第 {i+1} 组与第 {j+1} 组实际目标重叠；请关闭删除并使用单向同步，或包含源目录名以分开目标')
+                if task.direction == 'bidirectional' and overlaps(src, other_src):
+                    raise ValueError(f'第 {i+1} 组与第 {j+1} 组源重叠，不支持双向同步')
+        return mappings
 
     @app.get('/api/directories')
     def directories(path: str = '', offset: int = Query(0, ge=0), limit: int = Query(200, ge=1, le=500),
@@ -163,7 +205,7 @@ def create_app(database):
 
     @app.get('/api/health')
     def health():
-        return {'releaseVersion': __version__, 'mode': 'standalone', 'database': 'sqlite', 'version': 1, 'configSchemaVersion': 2, 'comparisonDetailsVersion': 1, 'timeOptionsVersion': 1, 'progressVersion': 1, 'logQueryVersion': 1}
+        return {'releaseVersion': __version__, 'mode': 'standalone', 'database': 'sqlite', 'version': 1, 'configSchemaVersion': 3, 'taskControlVersion': 1, 'networkRecoveryVersion': 1, 'scanArchitectureVersion': 1, 'comparisonDetailsVersion': 1, 'timeOptionsVersion': 1, 'progressVersion': 1, 'logQueryVersion': 1}
 
     @app.get('/api/tasks')
     def tasks():
@@ -186,63 +228,148 @@ def create_app(database):
             validate_task(task.model_dump())
         except ValueError as error:
             raise HTTPException(422, str(error))
-        with connect() as db:
-            if db.execute('UPDATE tasks SET config=? WHERE id=?', (task.model_dump_json(), task_id)).rowcount == 0:
-                raise HTTPException(404, '任务不存在')
+        with live_lock:
+            control = next((c for c in controls.values() if c.task_id == task_id), None)
+        def save():
+            with connect() as db:
+                if db.execute('UPDATE tasks SET config=? WHERE id=?', (task.model_dump_json(), task_id)).rowcount == 0:
+                    raise HTTPException(404, '任务不存在')
+        if control:
+            with control.condition:
+                if control.state != 'paused' or control.closed:
+                    raise HTTPException(409, '请先暂停任务，并等待正在处理的文件完成')
+                old = Task.model_validate(control.raw).model_dump()
+                # 旧版 source/target 是目录组的兼容别名，网页不再提交它们。
+                task.source, task.target = old['source'], old['target']
+                new = task.model_dump()
+                original = old['pathMappings']
+                if len(new['pathMappings']) < len(original) or new['pathMappings'][:len(original)] != original:
+                    raise HTTPException(409, '暂停任务不能删除、修改或重排已有目录组，只能追加目录组')
+                allowed = {'name', 'bandwidthLimit', 'maxRetries', 'retryInterval', 'continueOnError', 'parallelism', 'batchFiles', 'largeThresholdMb', 'networkRetryCount', 'networkRetryMinutes', 'pathMappings'}
+                if any(old[k] != new[k] for k in old.keys() - allowed):
+                    raise HTTPException(409, '暂停时仅可调整限速、重试、遇错继续、并发和批量参数；同步规则需结束后修改')
+                effective = validate_task(new)
+                with connect() as db:
+                    db.execute('UPDATE tasks SET config=? WHERE id=?', (task.model_dump_json(), task_id))
+                    snapshot = dict(control.config)
+                    snapshot.update({k: new[k] for k in allowed - {'pathMappings'}})
+                    snapshot['pathMappings'] = effective
+                    db.execute('UPDATE runs SET snapshot=? WHERE id=?', (json.dumps(snapshot), control.run_id))
+                    db.execute('INSERT INTO events(run_id,created,detail) VALUES(?,?,?)', (control.run_id, now(), json.dumps(dict(action='config_updated', reason='暂停期间修改参数或追加目录组', config=new), ensure_ascii=False)))
+                control.config.update({k: new[k] for k in allowed - {'pathMappings'}})
+                control.config['pathMappings'].extend(effective[len(original):])
+                control.raw = new
+        else:
+            save()
         return {'ok': True}
 
     @app.delete('/api/tasks/{task_id}')
     def remove(task_id: int):
+        with live_lock:
+            if any(c.task_id == task_id for c in controls.values()):
+                raise HTTPException(409, '执行中的任务不能删除')
         with connect() as db:
             if db.execute('DELETE FROM tasks WHERE id=?', (task_id,)).rowcount == 0:
                 raise HTTPException(404, '任务不存在')
         return {'ok': True}
 
     def execute(run_id, config):
+        with live_lock:
+            control = controls[run_id]
         progress = Progress(len(config['pathMappings']))
         with live_lock:
             live[run_id] = progress
         buffer = []
+        event_totals = dict(copied=0, skipped=0, deleted=0, ignored=0, failed=0, conflicts=0, bytes=0)
+        buffer_lock = threading.RLock()
         def flush():
-            if buffer:
-                with connect() as db:
-                    db.executemany('INSERT INTO events(run_id,created,detail) VALUES(?,?,?)', buffer)
-                buffer.clear()
+            with buffer_lock:
+                if buffer:
+                    with connect() as db:
+                        db.executemany('INSERT INTO events(run_id,created,detail) VALUES(?,?,?)', buffer)
+                    buffer.clear()
+        control.flush = flush
         def emit(event):
-            progress.update('event', action=event.get('action'))
-            buffer.append((run_id, now(), json.dumps(event, ensure_ascii=False)))
-            if len(buffer) >= 100:
-                flush()
+            with buffer_lock:
+                progress.update('event', action=event.get('action'))
+                key = 'conflicts' if event.get('action') == 'conflict' else event.get('action')
+                if key in event_totals:
+                    event_totals[key] += 1
+                if key == 'copied':
+                    event_totals['bytes'] += event.get('bytes', 0)
+                buffer.append((run_id, now(), json.dumps(event, ensure_ascii=False)))
+                if len(buffer) >= 100:
+                    flush()
+        def with_network_retry(operation, mapping_index):
+            attempt = 0
+            while True:
+                control.checkpoint()
+                try:
+                    return operation()
+                except Exception as error:
+                    if not config.get('continueOnError') or not network_error(error):
+                        raise
+                    limit = config.get('networkRetryCount', 3)
+                    exhausted = attempt >= limit
+                    if not exhausted:
+                        attempt += 1
+                    seconds = config.get('networkRetryMinutes', 3) * 60
+                    emit(dict(action='network_retry_exhausted' if exhausted else 'network_retry',
+                              mappingIndex=mapping_index, error=str(error), retryCount=attempt,
+                              retryLimit=limit, waitSeconds=None if exhausted else seconds,
+                              reason='重试次数用尽，保持暂停，请管理员检查网络后恢复' if exhausted else '网络或存储暂不可用，等待后重新比较本目录组，已完成文件按规则跳过'))
+                    flush()
+                    control.wait_for_retry(error, attempt, limit, seconds, exhausted)
+                    progress.update('group', index=mapping_index)
+                    if exhausted:
+                        attempt = 0
+
         try:
             summaries = []
             # 所有目录组先检查，再开始扫描/复制；双向模式两侧都要写入。
             progress.update('phase', phase='checking')
             for index, mapping in enumerate(config['pathMappings'], 1):
+                control.checkpoint()
                 destinations = [mapping['target']]
                 if config.get('direction') == 'bidirectional':
                     destinations.append(mapping['source'])
                 for destination in destinations:
                     try:
-                        detail = check_destination(destination, config['dryRun'])
+                        detail = with_network_retry(lambda: check_destination(destination, config['dryRun'], read_directory=config.get('syncStrategy') != 'COPY_ALL'), index)
                         emit(dict(detail, action='preflight', mappingIndex=index))
                     except Exception as error:
                         emit(dict(action='mapping_failed', mappingIndex=index, path=destination, error=str(error)))
                         raise
             flush()
-            for index, mapping in enumerate(config['pathMappings'], 1):
+            checked_count = len(config['pathMappings'])
+            index = 0
+            while True:
+                control.checkpoint()
+                if index >= len(config['pathMappings']):
+                    break
+                mapping = config['pathMappings'][index]
+                index += 1
+                progress.groups = len(config['pathMappings'])
+                # 追加目录也必须在开始该组前完成权限检查。
+                if index > checked_count:
+                    for destination in [mapping['target']] + ([mapping['source']] if config.get('direction') == 'bidirectional' else []):
+                        emit(dict(with_network_retry(lambda: check_destination(destination, config['dryRun'], read_directory=config.get('syncStrategy') != 'COPY_ALL'), index), action='preflight', mappingIndex=index))
                 progress.update('group', index=index)
                 def mapping_emit(event):
                     emit(dict(event, mappingIndex=index, source=mapping['source'], target=mapping['target']))
                 try:
                     mapping_emit(dict(action='mapping_started', comparisonMethod=method_name(config)))
-                    summary = synchronize(dict(config, **mapping, _progress=progress.update), mapping_emit)
+                    summary = with_network_retry(lambda: synchronize(dict(config, **mapping, _progress=progress.update, _control=control), mapping_emit), index)
                     summaries.append(dict(summary, **mapping, mappingIndex=index))
                     mapping_emit(dict(action='mapping_completed', result=summary))
                     flush()
                 except Exception as error:
                     mapping_emit(dict(action='mapping_failed', error=str(error)))
                     raise
+            control.close()
             result = {key: sum(r[key] for r in summaries) for key in ('copied', 'skipped', 'deleted', 'bytes', 'scanned', 'durationSeconds', 'unsupportedSkipped', 'ignored', 'failed', 'conflicts')}
+            result.update(event_totals)
+            result['durationSeconds'] = progress.snapshot()['elapsedSeconds']
             result.update(dryRun=config['dryRun'], mappings=summaries, progress=progress.snapshot())
             has_issues = result['failed'] > 0 or result['conflicts'] > 0
             status = ('preview_partial' if config['dryRun'] else 'partial') if has_issues else ('preview' if config['dryRun'] else 'success')
@@ -250,6 +377,10 @@ def create_app(database):
             with connect() as db:
                 db.execute('UPDATE runs SET status=?,ended=?,result=? WHERE id=?',
                            (status, now(), json.dumps(result), run_id))
+        except RunInterrupted as error:
+            flush()
+            with connect() as db:
+                db.execute("UPDATE runs SET status='interrupted',ended=?,error=?,result=? WHERE id=?", (now(), str(error), json.dumps(dict(progress=progress.snapshot())), run_id))
         except Exception as error:
             flush()
             with connect() as db:
@@ -257,6 +388,8 @@ def create_app(database):
         finally:
             with live_lock:
                 live.pop(run_id, None)
+                controls.pop(run_id, None)
+            control.close()
             gate.release()
 
     @app.post('/api/tasks/{task_id}/run', status_code=202)
@@ -268,7 +401,7 @@ def create_app(database):
                 row = db.execute('SELECT config FROM tasks WHERE id=?', (task_id,)).fetchone()
                 if not row:
                     raise HTTPException(404, '任务不存在')
-                config = json.loads(row['config'])
+                config = Task.model_validate(json.loads(row['config'])).model_dump()
                 try:
                     config['pathMappings'] = validate_task(config)
                 except ValueError as error:
@@ -277,11 +410,46 @@ def create_app(database):
                 cursor = db.execute('INSERT INTO runs(task_id,status,started,snapshot) VALUES(?,?,?,?)',
                                     (task_id, 'running', now(), json.dumps(config)))
                 run_id = cursor.lastrowid
+            def changed(status):
+                if status == 'paused' and hasattr(control, 'flush'):
+                    control.flush()
+                with connect() as db:
+                    db.execute('UPDATE runs SET status=? WHERE id=?', (status, run_id))
+                    db.execute('INSERT INTO events(run_id,created,detail) VALUES(?,?,?)', (run_id, now(), json.dumps(dict(action='control', reason={'pausing':'正在等待当前文件完成', 'paused':'已暂停，可修改参数或追加目录', 'running':'恢复执行', 'retry_wait':'网络或存储异常，等待定时重试'}[status]))))
+            control = RunControl(config, changed)
+            control.task_id, control.run_id = task_id, run_id
+            control.raw = Task.model_validate(json.loads(row['config'])).model_dump()
+            with live_lock:
+                controls[run_id] = control
             pool.submit(execute, run_id, config)
             return {'runId': run_id}
         except Exception:
             gate.release()
             raise
+
+    @app.post('/api/runs/{run_id}/pause')
+    def pause(run_id: int):
+        with live_lock:
+            control = controls.get(run_id)
+        if control is None:
+            raise HTTPException(409, '该执行已结束或程序已重启，不能暂停')
+        try:
+            control.pause()
+        except RunInterrupted as error:
+            raise HTTPException(409, str(error))
+        return {'status': control.state}
+
+    @app.post('/api/runs/{run_id}/resume')
+    def resume(run_id: int):
+        with live_lock:
+            control = controls.get(run_id)
+        if control is None:
+            raise HTTPException(409, '程序重启后请重新运行任务；已完成文件按比较规则跳过')
+        try:
+            control.resume()
+        except RunInterrupted as error:
+            raise HTTPException(409, str(error))
+        return {'status': control.state}
 
     @app.get('/api/runs')
     def runs():
@@ -291,6 +459,8 @@ def create_app(database):
             for row in rows:
                 if row['id'] in live:
                     row['progress'] = live[row['id']].snapshot()
+                if row['id'] in controls:
+                    row['recovery'] = controls[row['id']].recovery
         return rows
 
     @app.get('/api/runs/{run_id}/report')
@@ -313,7 +483,7 @@ def create_app(database):
                    q: str = Query('', max_length=256),
                    mapping: int | None = Query(None, ge=1),
                    order: Literal['asc', 'desc'] = 'asc'):
-        allowed = {'copied','skipped','ignored','failed','conflict','deleted','mapping_started','mapping_completed','mapping_failed','deletion_skipped','preflight'}
+        allowed = {'copied','skipped','ignored','failed','conflict','deleted','mapping_started','mapping_completed','mapping_failed','deletion_skipped','preflight','control','config_updated','network_retry','network_retry_exhausted'}
         if action and action not in allowed:
             raise HTTPException(422, '不支持的日志状态')
         clauses, values = ['run_id=?'], [run_id]

@@ -20,7 +20,7 @@ def main():
         config = path / 'application.yml'
         config.write_text('app:\n  host: 127.0.0.1\n  port: '+str(port)+'\ndatabase:\n  path: '+json.dumps(str(path/'test.sqlite3'))+'\n', encoding='utf-8')
         with (path/'runtime.log').open('wb') as log:
-            process = subprocess.Popen([sys.executable, str(ROOT/'backend/standalone_app.py'), '--config', str(config)], cwd=path, stdout=log, stderr=subprocess.STDOUT, env=dict(os.environ,PYTHONUTF8='1'))
+            process = subprocess.Popen([sys.executable, '-I', str(ROOT/'backend/standalone_app.py'), '--config', str(config)], cwd=path, stdout=log, stderr=subprocess.STDOUT, env=dict(os.environ,PYTHONUTF8='1'))
             try:
                 for _ in range(100):
                     if process.poll() is not None:

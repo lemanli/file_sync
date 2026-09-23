@@ -117,3 +117,13 @@ class FileTimeTests(unittest.TestCase):
         result=synchronize(updated,self.events.append)
         self.assertEqual(result['skipped'],1)
         self.assertEqual((self.b/'file').read_text(),'xyz')
+
+    @unittest.skipUnless(hasattr(os, 'chflags'), '仅 BSD/macOS 提供文件标志')
+    def test_network_share_rejects_bsd_flags_but_preserves_time(self):
+        # SMB 可以写数据、权限和时间，但拒绝本地文件系统标志。
+        import errno
+        with patch('os.chflags', side_effect=OSError(errno.EINVAL, '共享不支持文件标志')):
+            result = self.sync(comparisonMode='sha256', preserveTime=True, timeToleranceSeconds=0)
+        self.assertEqual(result['copied'], 1)
+        self.assertEqual((self.b / 'file').read_bytes(), (self.a / 'file').read_bytes())
+        self.assertEqual((self.b / 'file').stat().st_mtime_ns, (self.a / 'file').stat().st_mtime_ns)

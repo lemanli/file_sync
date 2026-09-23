@@ -62,11 +62,16 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   console.log('检查目录浏览');await page.locator('#folderAddress').fill(source);await page.locator('#folderGo').click();await page.waitForFunction(()=>!document.querySelector('#folderSelect').disabled);
   await page.locator('#folderSelect').click();assert.equal(await page.locator('[data-path=source]').inputValue(),source);
   await page.locator('[data-path=target]').fill(path.join(temp,'实际备份'));
+  await page.locator('[data-include-source-name]').check();
+  assert((await page.locator('#mappings').innerText()).includes(path.join(temp,'实际备份','工作资料')));
+  await page.locator('[data-include-source-name]').uncheck();
+
   await page.locator('#addMapping').click();assert.equal(await page.locator('.mapping').count(),2);
   await page.locator('.mapping').last().getByRole('button',{name:'移除'}).click();
   // 离开未保存表单时可以取消，不丢失输入。
   page.once('dialog',dialog=>dialog.dismiss());await page.locator('#tab-tasks').click();assert(await page.locator('#panel-editor').isVisible());
-  await page.locator('#rulePreset').selectOption('mirror');await page.locator('#applyPreset').click();assert(await page.locator('input[name=delete]').isChecked());
+  await page.locator('#syncStrategy').selectOption('COPY_ALL');assert(await page.locator('#comparisonMethod').isDisabled());assert(await page.locator('#syncDirection').isDisabled());
+  await page.locator('#rulePreset').selectOption('mirror');await page.locator('#applyPreset').click();assert(await page.locator('input[name=delete]').isChecked());assert.equal(await page.locator('#syncStrategy').inputValue(),'AUTO');assert(!(await page.locator('#comparisonMethod').isDisabled()));
   await page.locator('#rulePreset').selectOption('merge');await page.locator('#applyPreset').click();assert.equal(await page.locator('#syncDirection').inputValue(),'bidirectional');assert(await page.locator('input[name=delete]').isDisabled());
   await page.locator('#rulePreset').selectOption('project');await page.locator('#applyPreset').click();assert((await page.locator('textarea[name=ignorePatterns]').inputValue()).includes('node_modules/'));assert(await page.locator('input[name=continueOnError]').isChecked());
   await page.locator('#rulePreset').selectOption('incremental');await page.locator('#applyPreset').click();assert(!(await page.locator('input[name=delete]').isChecked()));
@@ -156,6 +161,33 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   await page.waitForFunction(()=>!document.querySelector('#liveProgress').classList.contains('stale'));
   await page.waitForFunction(()=>document.querySelector('#liveProgress').hidden);
   await page.locator('#tab-tasks').click();
+  // 文件边界暂停、目录锁定和参数修改的真实浏览器回归。
+  const pauseSource=path.join(temp,'pause-source');fs.mkdirSync(pauseSource);
+  for(let n=0;n<3;n++)fs.writeFileSync(path.join(pauseSource,`${n}.bin`),Buffer.alloc(1024*1024,1));
+  const pauseTask=await request('/tasks',{name:'暂停编辑验证',source:pauseSource,target:path.join(temp,'pause-target'),parallelism:1,batchFiles:1,bandwidthLimit:512});
+  await request(`/tasks/${pauseTask.id}/run`,{dryRun:false});
+  await page.locator('#taskSearch').fill('暂停编辑验证');await page.locator('#refreshTasks').click();
+  await page.locator('#tasks').getByRole('button',{name:'暂停',exact:true}).click();
+  await page.waitForFunction(()=>document.querySelector('#liveProgress').textContent.includes('已暂停'));
+  await page.locator('#refreshTasks').click();
+  await page.locator('#tasks summary').click();await page.getByRole('button',{name:'编辑任务',exact:true}).click();
+  assert(await page.locator('[data-path=source]').isDisabled());
+  assert(await page.locator('[data-path=target]').isDisabled());
+  assert(!(await page.locator('#addMapping').isDisabled()));
+  await page.locator('[name=bandwidthLimit]').fill('0');
+  await page.locator('#saveTask').click();
+  await page.locator('#tasks').getByRole('button',{name:'恢复',exact:true}).click();
+  await page.waitForFunction(()=>document.querySelector('#liveProgress').hidden);
+  await page.locator('#taskSearch').fill('');
+  // 网络恢复状态的倒计时、次数和管理员恢复入口。
+  let retryStatus='retry_wait';
+  await page.route('**/api/runs',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify([{id:900,task_id:pauseTask.id,status:retryStatus,started:new Date().toISOString(),snapshot:'{}',progress:{},recovery:{attempt:1,limit:3,error:'模拟连接超时',nextRetryAt:Date.now()/1000+180,requiresResume:retryStatus==='paused'}}])}));
+  await page.locator('#refreshTasks').click();
+  await page.waitForFunction(()=>document.querySelector('#liveProgress').textContent.includes('第 1/3 次'));
+  assert(await page.locator('#liveProgress').getByRole('button',{name:'立即重试'}).isVisible());
+  retryStatus='paused';await page.locator('#refreshTasks').click();
+  await page.waitForFunction(()=>document.querySelector('#liveProgress').textContent.includes('等待管理员恢复'));
+  await page.unroute('**/api/runs');await page.locator('#refreshTasks').click();
   // 新网页对旧后台拒绝提交，避免 Pydantic 静默丢弃新字段。
   let unexpectedRuns=0;
   await page.route('**/api/health',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({mode:'standalone',version:1})}));

@@ -21,11 +21,7 @@ jobs:
       - name: Build source archives and checksums
         shell: bash
         run: |
-          mkdir -p dist
-          git archive --format=zip --prefix="file_sync-$GITHUB_REF_NAME/" HEAD > "dist/file_sync-$GITHUB_REF_NAME.zip"
-          git archive --format=tar.gz --prefix="file_sync-$GITHUB_REF_NAME/" HEAD > "dist/file_sync-$GITHUB_REF_NAME.tar.gz"
-          cd dist
-          sha256sum *.zip *.tar.gz > SHA256SUMS
+          python scripts/build_dist.py
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

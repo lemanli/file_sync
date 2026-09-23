@@ -39,7 +39,7 @@ class FolderTests(unittest.TestCase):
         r=self.client.post('/api/tasks',headers=self.headers,json={'name':'多目录','pathMappings':self.mappings})
         self.assertEqual(r.status_code,200,r.text)
         tid=r.json()['id']
-        self.assertEqual(self.client.get('/api/tasks').json()[0]['pathMappings'],self.mappings)
+        self.assertEqual(self.client.get('/api/tasks').json()[0]['pathMappings'],[dict(m,includeSourceName=False) for m in self.mappings])
         r=self.client.post(f'/api/tasks/{tid}/run',headers=self.headers,json={'dryRun':False})
         self.assertEqual(r.status_code,202,r.text)
         for _ in range(100):
@@ -53,7 +53,7 @@ class FolderTests(unittest.TestCase):
         self.assertTrue(any('mappingIndex' in e['detail'] for e in events))
 
     def test_overlap_between_mappings_rejected(self):
-        for target in (self.mappings[0]['target'],self.mappings[0]['target']+'/child',self.mappings[0]['source']):
+        for target in (self.mappings[0]['source'],):
             mappings=[self.mappings[0],dict(self.mappings[1],target=target)]
             r=self.client.post('/api/tasks',headers=self.headers,json={'name':'冲突','pathMappings':mappings})
             self.assertEqual(r.status_code,422,r.text)
@@ -135,3 +135,26 @@ class FolderTests(unittest.TestCase):
         self.assertEqual(response.json()['total'],0)
         self.assertEqual(response.json()['directories'],[])
         self.assertEqual(self.client.get('/api/directories',params={'path':str(folder),'sort':'bad'}).status_code,422)
+
+    def test_shared_targets_allowed_except_delete_and_bidirectional(self):
+        mappings=[self.mappings[0],dict(self.mappings[1],target=self.mappings[0]['target'])]
+        for options, expected in [({},200),({'delete':True},422),({'direction':'bidirectional'},422)]:
+            response=self.client.post('/api/tasks',headers=self.headers,json=dict(name='共享目标',pathMappings=mappings,**options))
+            self.assertEqual(response.status_code,expected,response.text)
+
+    def test_include_source_name_actual_copy_and_persistence(self):
+        mappings=[dict(m,target=str(self.root/'shared'),includeSourceName=True) for m in self.mappings]
+        response=self.client.post('/api/tasks',headers=self.headers,json=dict(name='包含目录名',pathMappings=mappings,delete=True))
+        self.assertEqual(response.status_code,200,response.text)
+        tid=response.json()['id']
+        self.assertEqual(self.client.get('/api/tasks').json()[0]['pathMappings'],mappings)
+        response=self.client.post(f'/api/tasks/{tid}/run',headers=self.headers,json={'dryRun':False})
+        self.assertEqual(response.status_code,202,response.text)
+        for _ in range(100):
+            run=self.client.get('/api/runs').json()[0]
+            if run['status']!='running':break
+            time.sleep(.02)
+        self.assertEqual(run['status'],'success',run)
+        for mapping in mappings:
+            name=Path(mapping['source']).name
+            self.assertEqual((self.root/'shared'/name/'文件.txt').read_text(),name)

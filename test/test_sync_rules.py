@@ -173,7 +173,7 @@ class RuleTests(unittest.TestCase):
         outside=self.root/'outside';outside.mkdir()
         barrier=threading.Barrier(3)
         original_walk=os.walk;original_fsync=os.fsync;original_event=threading.Event
-        captured={};walk_count=0
+        captured={}
         def event_factory(*args,**kwargs):
             event=original_event(*args,**kwargs)
             captured.setdefault('stop',event)
@@ -183,9 +183,8 @@ class RuleTests(unittest.TestCase):
             captured['stop'].wait(timeout=5)
             original_fsync(fd)
         def walk(top,*args,**kwargs):
-            nonlocal walk_count
-            if Path(top)==self.a:walk_count+=1
-            mutate=Path(top)==self.a and walk_count==2
+            # 预检已使用 scandir，这里针对执行遍历时的路径替换。
+            mutate=Path(top)==self.a
             for row in original_walk(top,*args,**kwargs):
                 if mutate and Path(row[0])==self.a/'child':
                     barrier.wait(timeout=5)

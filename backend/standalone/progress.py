@@ -11,11 +11,13 @@ class Progress:
         self.group = 0
         self.phase = 'queued'
         self.scanned = self.discovered = self.finished = self.written = 0
+        self.scan_path = self.scan_side = None
         self.total = None
         self.scan_complete = False
         self.counts = dict(copied=0, skipped=0, failed=0, ignored=0, deleted=0, conflicts=0)
         self.active = {}
-        self.samples = [(self.started, 0, 0)]
+        self.scan_metrics = {}
+        self.samples = [(self.started, 0, 0, 0)]
 
     def update(self, kind, **data):
         with self.lock:
@@ -26,8 +28,12 @@ class Progress:
                 self.total = None
                 self.scan_complete = False
                 self.active.clear()
+            elif kind == 'metrics':
+                self.scan_metrics = dict(data)
             elif kind == 'scan':
-                self.scanned += 1
+                self.scanned += data.get('count', 1)
+                self.scan_path = data.get('path', self.scan_path)
+                self.scan_side = data.get('side', self.scan_side)
             elif kind == 'discovered':
                 self.discovered += 1
             elif kind == 'total':
@@ -59,12 +65,18 @@ class Progress:
             processed = self.counts['copied'] + self.counts['skipped'] + self.counts['failed'] + self.counts['conflicts']
             # 至多保留约十秒采样，频繁 API 请求不会导致无界增长。
             if current - self.samples[-1][0] >= 1:
-                self.samples.append((current, self.written, processed))
+                self.samples.append((current, self.written, processed, self.scanned))
             while len(self.samples) > 2 and self.samples[1][0] < current - 10:
                 self.samples.pop(0)
             first = self.samples[0]
             seconds = max(current - first[0], .001)
-            return dict(phase=self.phase, mappingIndex=self.group, mappingCount=self.groups,
+            return dict(scanMetrics=dict(self.scan_metrics),
+                        sourceScanRate=self.scan_metrics.get('sourceEntries',0)/max(current-self.started,.001),
+                        targetScanRate=self.scan_metrics.get('targetEntries',0)/max(current-self.started,.001),
+                        directoriesPerSecond=(self.scan_metrics.get('sourceDirectories',0)+self.scan_metrics.get('targetDirectories',0))/max(current-self.started,.001),
+                        phase=self.phase, mappingIndex=self.group, mappingCount=self.groups,
+                        scanPath=self.scan_path, scanSide=self.scan_side,
+                        scanEntriesPerSecond=(self.scanned-first[3])/seconds,
                         scannedEntries=self.scanned, discovered=self.discovered, finished=self.finished,
                         totalFiles=self.total, scanComplete=self.scan_complete, counts=dict(self.counts), writtenBytes=self.written,
                         bytesPerSecond=(self.written-first[1])/seconds,

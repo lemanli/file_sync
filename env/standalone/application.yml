@@ -5,3 +5,7 @@ app:
 database:
   # 相对路径以项目根目录解析；备份时关闭程序再复制 data 目录。
   path: data/standalone/file_sync.sqlite3
+  # 填固定本机目录即可跨版本复用，优先于上面的 path。例如 D:/FileSyncData。
+  directory: ''
+  # 可选：首次导入的旧数据目录或 sqlite3 文件。已有目标库时不再迁移。
+  migrate_from: ''
