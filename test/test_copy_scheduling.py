@@ -82,3 +82,67 @@ class SchedulingTests(unittest.TestCase):
                 self.assertEqual(result['copied'], 4)
                 for path in source.iterdir():
                     self.assertEqual(path.read_bytes(), (target / path.name).read_bytes())
+
+    def test_temporary_file_metadata_is_not_serialized_across_files(self):
+        import shutil
+        import tempfile
+        from unittest.mock import patch
+        from standalone.engine import synchronize
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder).resolve() / 'source'; source.mkdir()
+            target = Path(folder).resolve() / 'target'
+            for n in range(4):
+                (source / str(n)).write_text(str(n))
+            barrier = threading.Barrier(4)
+            original = shutil.copymode
+            def metadata(*args, **kwargs):
+                barrier.wait(timeout=3)
+                return original(*args, **kwargs)
+            with patch('standalone.engine.shutil.copymode', side_effect=metadata):
+                result = synchronize(dict(source=str(source), target=str(target),
+                                          syncStrategy='COPY_ALL', parallelism=4, batchFiles=500,
+                                          maxRetries=0), lambda event: None)
+            self.assertEqual(result['copied'], 4)
+            for path in source.iterdir():
+                self.assertEqual(path.read_bytes(), (target / path.name).read_bytes())
+
+    def test_different_files_publish_concurrently(self):
+        import os
+        import tempfile
+        from unittest.mock import patch
+        from standalone.engine import synchronize
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder).resolve() / 'source'; source.mkdir()
+            target = Path(folder).resolve() / 'target'
+            for n in range(4):
+                (source / str(n)).write_text(str(n))
+            barrier = threading.Barrier(4)
+            original = os.replace
+            def publish(*args, **kwargs):
+                barrier.wait(timeout=3)
+                return original(*args, **kwargs)
+            with patch('standalone.engine.os.replace', side_effect=publish):
+                result = synchronize(dict(source=str(source), target=str(target),
+                                          syncStrategy='COPY_ALL', parallelism=4, batchFiles=500,
+                                          maxRetries=0), lambda event: None)
+            self.assertEqual(result['copied'], 4)
+
+    def test_same_target_serializes_and_releases_lock_entries(self):
+        from standalone.file_locks import FilePublishLocks
+        locks = FilePublishLocks()
+        attempted = threading.Event(); acquired = threading.Event()
+        def publish():
+            attempted.set()
+            with locks.hold('A/é'):
+                acquired.set()
+        with locks.hold('a/e\u0301'):
+            worker = threading.Thread(target=publish); worker.start()
+            self.assertTrue(attempted.wait(1))
+            self.assertFalse(acquired.wait(.05), '等价目标路径不能并发发布')
+        worker.join(2)
+        self.assertTrue(acquired.is_set())
+        self.assertEqual(locks._entries, {})
+        with self.assertRaises(ValueError):
+            with locks.hold('error'):
+                raise ValueError('测试发布失败')
+        self.assertEqual(locks._entries, {})

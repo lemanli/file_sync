@@ -15,9 +15,17 @@ def main():
     parser.add_argument('--parallelism', type=int, default=32)
     parser.add_argument('--batch', type=int, default=500)
     parser.add_argument('--output')
+    parser.add_argument('--metadata-delay-ms', type=float, default=0, help='仅模拟每文件权限操作延迟，不是真实网络测量')
     args = parser.parse_args()
     sys.path.insert(0, args.backend)
     from standalone.engine import synchronize
+    from contextlib import nullcontext
+    from unittest.mock import patch
+    import shutil
+    original_copymode = shutil.copymode
+    def delayed_copymode(*args_, **kwargs):
+        time.sleep(max(0, args.metadata_delay_ms) / 1000)
+        return original_copymode(*args_, **kwargs)
     lock = threading.Lock(); active = set(); peak = 0
     def progress(kind, **data):
         nonlocal peak
@@ -33,13 +41,14 @@ def main():
             payload = b'x' * (2 * 1024 * 1024 if n % 200 == 0 else 4096)
             (source / str(n)).write_bytes(payload); total += len(payload)
         start = time.perf_counter()
-        result = synchronize(dict(source=str(source), target=str(root / 'target'),
-                                  syncStrategy='COMPARE_METADATA', scanWorkers=16,
-                                  parallelism=args.parallelism, batchFiles=args.batch,
-                                  largeThresholdMb=1, maxRetries=0, _progress=progress), lambda event: None)
+        with patch('standalone.engine.shutil.copymode', side_effect=delayed_copymode) if args.metadata_delay_ms > 0 else nullcontext():
+            result = synchronize(dict(source=str(source), target=str(root / 'target'),
+                                      syncStrategy='COMPARE_METADATA', scanWorkers=16,
+                                      parallelism=args.parallelism, batchFiles=args.batch,
+                                      largeThresholdMb=1, maxRetries=0, _progress=progress), lambda event: None)
         elapsed = time.perf_counter() - start
         assert result['copied'] == args.files and result['bytes'] == total, result
-        report = dict(files=args.files, bytes=total, seconds=elapsed, filesPerSecond=args.files / elapsed,
+        report = dict(simulatedMetadataDelayMs=args.metadata_delay_ms, files=args.files, bytes=total, seconds=elapsed, filesPerSecond=args.files / elapsed,
                       peakActiveFiles=peak, parallelism=args.parallelism, batchFiles=args.batch,
                       copyMiBps=total / elapsed / 1024 / 1024, result=result)
         text = json.dumps(report, ensure_ascii=False, indent=2)

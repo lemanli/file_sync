@@ -190,6 +190,15 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   retryStatus='paused';await page.locator('#refreshTasks').click();
   await page.waitForFunction(()=>document.querySelector('#liveProgress').textContent.includes('等待管理员恢复'));
   await page.unroute('**/api/runs');await page.locator('#refreshTasks').click();
+  // 活动文件列表不能截断为 4 条，并显示等待发布的阶段。
+  const activity={phase:'syncing',mappingIndex:1,mappingCount:1,scannedEntries:32,elapsedSeconds:10,
+   counts:{copied:0,skipped:0,failed:0,conflicts:0,ignored:0,deleted:0},filesPerSecond:0,bytesPerSecond:0,writtenBytes:0,
+   totalFiles:null,discovered:32,finished:0,activeFiles:Array.from({length:32},(_,i)=>({path:`并发文件-${i}`,phase:'publish_wait',phaseSeconds:3,size:1,written:1}))};
+  await page.route('**/api/runs',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify([{id:901,task_id:pauseTask.id,status:'running',started:new Date().toISOString(),snapshot:JSON.stringify({parallelism:32,batchFiles:500,scanWorkers:16,syncStrategy:'COPY_ALL'}),progress:activity}])}));
+  await page.locator('#refreshTasks').click();
+  await page.waitForFunction(()=>document.querySelectorAll('#liveProgress .active-file').length===32);
+  assert((await page.locator('#liveProgress').innerText()).includes('等待发布锁：并发文件-0（本阶段 3 秒）'));
+  await page.unroute('**/api/runs');await page.locator('#refreshTasks').click();
   // 新网页对旧后台拒绝提交，避免 Pydantic 静默丢弃新字段。
   let unexpectedRuns=0;
   await page.route('**/api/health',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({mode:'standalone',version:1})}));

@@ -94,7 +94,8 @@ def _synchronize_one(config, emit):
     source_identity = (src.stat().st_dev, src.stat().st_ino)
     target_identity = (dst.stat().st_dev, dst.stat().st_ino) if dst.exists() else None
     stop = threading.Event()
-    publish_lock = threading.Lock()
+    from .file_locks import FilePublishLocks
+    publish_locks = FilePublishLocks()
     network_failure = []
     def raise_network(error):
         if config.get('continueOnError') and network_error(error):
@@ -343,7 +344,26 @@ def _synchronize_one(config, emit):
                         raise RuntimeError(f'哈希校验失败：{relative}')
                     verification = dict(sourceSha256=source_hash, writtenSha256=written_hash)
                     detail['source']['sha256'] = source_hash
-                with publish_lock:
+                progress('file', path=str(relative), size=before.st_size, written=written, phase='metadata')
+                written_stat = temp.stat()
+                # 仅复制权限；时间在下方按任务配置单独写入并校验。
+                # copystat 还会复制 BSD 标志，macOS 文件同步到 SMB 时可能报 EINVAL。
+                shutil.copymode(source, temp)
+                preserve = config.get('preserveTime', True)
+                # 使用复制前快照；读取源文件可能改变访问时间。
+                times = (before.st_atime_ns, before.st_mtime_ns) if preserve else (written_stat.st_atime_ns, written_stat.st_mtime_ns)
+                os.utime(temp, ns=times)
+                stored_mtime = temp.stat().st_mtime_ns
+                difference = abs(stored_mtime - before.st_mtime_ns)
+                timestamps = dict(preserved=preserve, sourceMtimeNs=str(before.st_mtime_ns),
+                                  targetMtimeNs=str(stored_mtime), differenceNs=str(difference),
+                                  toleranceSeconds=tolerance_ns(config)/1_000_000_000,
+                                  withinTolerance=difference <= tolerance_ns(config))
+                if preserve and difference > tolerance_ns(config):
+                    raise RuntimeError(f'目标文件系统无法在时间容差内保留源修改时间：{relative}（差 {difference/1_000_000_000:g} 秒）')
+                progress('file', path=str(relative), size=before.st_size, written=written, phase='publish_wait')
+                with publish_locks.hold(target):
+                    progress('file', path=str(relative), size=before.st_size, written=written, phase='publishing')
                     check_stop()
                     check_source()
                     check_target(target)
@@ -351,22 +371,6 @@ def _synchronize_one(config, emit):
                         from .two_way import fingerprint
                         if fingerprint(source) != expected[0] or fingerprint(target) != expected[1]:
                             raise RuntimeError(f'源或目标在复制期间发生变化：{relative}')
-                    written_stat = temp.stat()
-                    # 仅复制权限；时间在下方按任务配置单独写入并校验。
-                    # copystat 还会复制 BSD 标志，macOS 文件同步到 SMB 时可能报 EINVAL。
-                    shutil.copymode(source, temp)
-                    preserve = config.get('preserveTime', True)
-                    # 使用复制前快照；读取源文件可能改变访问时间。
-                    times = (before.st_atime_ns, before.st_mtime_ns) if preserve else (written_stat.st_atime_ns, written_stat.st_mtime_ns)
-                    os.utime(temp, ns=times)
-                    stored_mtime = temp.stat().st_mtime_ns
-                    difference = abs(stored_mtime - before.st_mtime_ns)
-                    timestamps = dict(preserved=preserve, sourceMtimeNs=str(before.st_mtime_ns),
-                                      targetMtimeNs=str(stored_mtime), differenceNs=str(difference),
-                                      toleranceSeconds=tolerance_ns(config)/1_000_000_000,
-                                      withinTolerance=difference <= tolerance_ns(config))
-                    if preserve and difference > tolerance_ns(config):
-                        raise RuntimeError(f'目标文件系统无法在时间容差内保留源修改时间：{relative}（差 {difference/1_000_000_000:g} 秒）')
                     check_stop()
                     if optimized and config['syncStrategy']=='SKIP_EXISTING':
                         from .publication import publish_if_absent

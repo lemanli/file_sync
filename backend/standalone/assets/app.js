@@ -75,7 +75,7 @@ function renderTasks(){
  }
 }
 // 每两秒展示一次有界快照；进度不依赖逐条读取文件日志。
-const phaseNames={checking:'检查目标读写权限',queued:'等待启动',scanning:'扫描目录',planning:'双向比较与规划',syncing:'比较与同步',copying:'写入临时文件',comparing:'比较文件',verifying:'校验写入内容',finalizing:'清理与收尾'};
+const phaseNames={checking:'检查目标读写权限',queued:'等待启动',scanning:'扫描目录',planning:'双向比较与规划',syncing:'比较与同步',copying:'写入临时文件',comparing:'比较文件',verifying:'校验写入内容',metadata:'写入权限和时间',publish_wait:'等待发布锁',publishing:'检查路径并发布文件',finalizing:'清理与收尾'};
 let lastProgressRefresh=0,progressDisconnected=false;
 function progressFreshness(failed=false){
  const box=el('liveProgress');if(box.hidden)return;
@@ -110,14 +110,13 @@ function renderProgress(box,run){
   box.append(node('span',`本组文件处理：${done}/${p.totalFiles}（${(done/p.totalFiles*100).toFixed(1)}%）；${p.scanComplete?'已完成枚举':'预检总量，目录变化时会校正'}；含跳过和失败，仍需完成收尾。`),bar);
  }else box.append(node('span',`本组已发现 ${p.discovered} 个待处理文件，已处理 ${p.finished} 个；总量未确定，不估算完成率。`,'muted'));
  if(!p.activeFiles.length)box.append(node('p',stage===0?'正在遍历目录并检查条目，总量确定前持续更新扫描计数。':stage===2?'正在处理目标清理和收尾，请等待最终结果。':'正在枚举文件、收集处理结果或等待存储响应；当前没有活动文件快照。','activity-description'));
- for(const file of p.activeFiles.slice(0,4)){
+ for(const file of p.activeFiles){
   const item=node('div',undefined,'active-file');
-  const label=node('span',(phaseNames[file.phase]||file.phase)+'：'+file.path,'active-path');label.title=file.path;item.append(label);
+  const label=node('span',(phaseNames[file.phase]||file.phase)+'：'+file.path+`（本阶段 ${Math.floor(file.phaseSeconds??0)} 秒）`,'active-path');label.title=file.path;item.append(label);
   if(file.phase==='copying'&&file.size>0){const bar=node('progress');bar.max=file.size;bar.value=Math.min(file.written,file.size);bar.setAttribute('aria-label','当前文件写入进度');item.append(node('span',`${bytes(file.written)} / ${bytes(file.size)}（${Math.min(100,file.written/file.size*100).toFixed(1)}%）`),bar)}
   box.append(item);
  }
  if(p.scanMetrics&&Object.keys(p.scanMetrics).length){const m=p.scanMetrics;box.append(node('p',`源 ${Number(p.sourceScanRate??0).toFixed(0)} / 目标 ${Number(p.targetScanRate??0).toFixed(0)} 条目/秒 · ${Number(p.directoriesPerSecond??0).toFixed(1)} 目录/秒（自启动均值）`),node('p',`扫描队列 ${m.directoryQueueLength??0} · 复制排队上限估计 ${m.copyQueueLength??0} · 显式属性读取 ${m.metadataCalls??0} · 原生枚举调用 ${m.nativeCalls??0} · 回退 ${m.fallbacks??0}`));}
- if(p.activeFiles.length>4)box.append(node('span',`另有 ${p.activeFiles.length-4} 个文件正在处理`,'muted'));
  box.append(node('small','每 2 秒刷新；动画仅表示运行状态，实际进展以计数和路径为准。计数随处理批次更新。写入速率包含重试，不含哈希读取；文件写完仍需校验和替换。'));
 }
 function renderRuns(){

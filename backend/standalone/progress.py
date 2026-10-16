@@ -44,10 +44,12 @@ class Progress:
             elif kind == 'phase':
                 self.phase = data['phase']
             elif kind == 'file':
-                self.active[threading.get_ident()] = data
+                self.active[threading.get_ident()] = dict(data, phaseStarted=time.monotonic())
             elif kind == 'written':
                 self.written += data['delta']
-                self.active[threading.get_ident()] = dict(path=data['path'], size=data['size'], written=data['written'], phase='copying')
+                previous = self.active.get(threading.get_ident(), {})
+                started = previous.get('phaseStarted', time.monotonic()) if previous.get('phase') == 'copying' else time.monotonic()
+                self.active[threading.get_ident()] = dict(path=data['path'], size=data['size'], written=data['written'], phase='copying', phaseStarted=started)
             elif kind == 'clear_file':
                 self.active.pop(threading.get_ident(), None)
             elif kind == 'file_done':
@@ -82,4 +84,6 @@ class Progress:
                         bytesPerSecond=(self.written-first[1])/seconds,
                         filesPerSecond=(processed-first[2])/seconds,
                         elapsedSeconds=current-self.started,
-                        activeFiles=[dict(value) for value in self.active.values()])
+                        activeFiles=[dict({k:v for k,v in value.items() if k != 'phaseStarted'},
+                                          phaseSeconds=max(0,current-value.get('phaseStarted',current)))
+                                     for value in self.active.values()])

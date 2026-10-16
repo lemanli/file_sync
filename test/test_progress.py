@@ -12,6 +12,21 @@ from fastapi.testclient import TestClient
 
 
 class ProgressTests(unittest.TestCase):
+    def test_phase_duration_survives_byte_updates(self):
+        from unittest.mock import patch
+        with patch('standalone.progress.time.monotonic', return_value=100) as clock:
+            progress = Progress(1)
+            progress.update('file', path='file', size=10, written=0, phase='copying')
+            clock.return_value = 102
+            progress.update('written', path='file', size=10, written=5, delta=5)
+            clock.return_value = 105
+            self.assertEqual(progress.snapshot()['activeFiles'][0]['phaseSeconds'], 5)
+            progress.update('file', path='file', size=10, written=10, phase='publishing')
+            clock.return_value = 107
+            active = progress.snapshot()['activeFiles'][0]
+            self.assertEqual(active['phaseSeconds'], 2)
+            self.assertNotIn('phaseStarted', active)
+
     def test_bounded_and_snapshot_isolation(self):
         p=Progress(1)
         for i in range(10000):
