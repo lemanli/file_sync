@@ -63,6 +63,9 @@ class ControlTests(unittest.TestCase):
                     self.assertEqual(client.delete(f'/api/tasks/{tid}',headers=headers).status_code,409)
                     saved.pop('source',None);saved.pop('target',None)
                     saved['bandwidthLimit']=1024
+                    saved['scanWorkers']=16
+                    saved['parallelism']=8
+                    saved['batchFiles']=500
                     saved['pathMappings'].append(dict(source=str(extra),target=str(root/'extra-backup')))
                     response=client.put(f'/api/tasks/{tid}',json=saved,headers=headers)
                     self.assertEqual(response.status_code,200,response.text)

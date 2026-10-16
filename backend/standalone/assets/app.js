@@ -100,6 +100,8 @@ function renderProgress(box,run){
  box.append(node('strong',taskName(run)+' · '+(dry?'演练 · ':'')+(phaseNames[p.phase]||p.phase)));
  box.append(node('p',`目录组 ${p.mappingIndex}/${p.mappingCount} · 已检查 ${p.scannedEntries} 个条目 · 已运行 ${Math.floor(p.elapsedSeconds)} 秒`));
  if(p.phase==='scanning'||p.phase==='planning'){box.append(node('p',`扫描 ${(p.scanEntriesPerSecond??0).toFixed(0)} 条目/秒 · ${p.scanSide==='target'?'目标端':p.scanSide==='source'?'源端':'两端规划'}`));if(p.scanPath)box.append(node('p',p.scanPath,'active-path'))}
+ const settings=parse(run.snapshot);
+ box.append(node('p',`活动文件 ${p.activeFiles.length} / 并发上限 ${settings.parallelism??4} · 入队批量 ${settings.batchFiles??100} · ${settings.syncStrategy&&settings.syncStrategy!=='AUTO'?`目录并发上限 ${settings.scanWorkers??1}`:'兼容扫描（目录并发不适用）'}`));
  const c=p.counts;
  box.append(node('p',`${dry?'预计':''}复制 ${c.copied} · 跳过 ${c.skipped} · 失败 ${c.failed} · 冲突 ${c.conflicts} · 忽略 ${c.ignored} · 删除 ${c.deleted}`));
  box.append(node('p',`近期处理 ${p.filesPerSecond.toFixed(1)} 文件/秒 · 写入 ${bytes(p.bytesPerSecond)}/秒 · 累计写入 ${bytes(p.writtenBytes)}`));
@@ -178,7 +180,7 @@ function startEditor(task=null,copy=false){
  updateDirection();el('mappings').replaceChildren();(task?mappingsOf(task):[{}]).forEach(addMapping);
  const current=!copy&&task?state.runs.find(r=>r.task_id===task.id&&activeRun(r)):null;
  if(current){
-  const editable=['name','bandwidthLimit','maxRetries','retryInterval','continueOnError','parallelism','batchFiles','largeThresholdMb','networkRetryCount','networkRetryMinutes'];
+  const editable=['name','bandwidthLimit','maxRetries','retryInterval','continueOnError','scanWorkers','parallelism','batchFiles','largeThresholdMb','networkRetryCount','networkRetryMinutes'];
   for(const input of form.querySelectorAll('[name]'))input.disabled=current.status!=='paused'||!editable.includes(input.name);
   for(const input of el('mappings').querySelectorAll('input,button'))input.disabled=true;
   el('addMapping').disabled=current.status!=='paused';el('applyPreset').disabled=true;el('rulePreset').disabled=true;
@@ -186,7 +188,7 @@ function startEditor(task=null,copy=false){
  }
 
  if(!current)updateScanStrategy();
- el('editorTitle').textContent=copy?'复制任务配置':task?'编辑任务':'新建任务';el('editing').textContent=task&&!copy?'修改后请保存，后续运行才会使用新配置':'尚未保存';el('tab-editor').hidden=false;showTab('editor',true);state.dirty=copy;if(current)message(current.status==='paused'?'暂停编辑：已有目录已锁定，可追加目录组。限速和重试从后续文件生效，并发及批量参数从下一目录组生效。':'请先暂停并等待当前文件完成后编辑。');form.elements.name.focus();
+ el('editorTitle').textContent=copy?'复制任务配置':task?'编辑任务':'新建任务';el('editing').textContent=task&&!copy?'修改后请保存，后续运行才会使用新配置':'尚未保存';el('tab-editor').hidden=false;showTab('editor',true);state.dirty=copy;if(current)message(current.status==='paused'?'暂停编辑：已有目录已锁定，可追加目录组。恢复后文件并发立即生效，目录并发和批量参数用于后续调度；已在扫描的目录不会中断。':'请先暂停并等待当前文件完成后编辑。');form.elements.name.focus();
 }
 form.oninput=()=>{state.dirty=true};
 form.onsubmit=async event=>{

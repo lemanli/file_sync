@@ -1,0 +1,40 @@
+{
+  "files": 2000,
+  "bytes": 29122560,
+  "seconds": 0.6803546659648418,
+  "filesPerSecond": 2939.64324792821,
+  "peakActiveFiles": 32,
+  "parallelism": 32,
+  "batchFiles": 500,
+  "copyMiBps": 40.82199900931557,
+  "result": {
+    "copied": 2000,
+    "skipped": 0,
+    "deleted": 0,
+    "bytes": 29122560,
+    "scanned": 2000,
+    "unsupportedSkipped": 0,
+    "ignored": 0,
+    "failed": 0,
+    "conflicts": 0,
+    "deletionSkipped": false,
+    "scanMetrics": {
+      "sourceEntries": 2000,
+      "targetEntries": 0,
+      "sourceDirectories": 1,
+      "targetDirectories": 1,
+      "metadataCalls": 0,
+      "extraStatCount": 0,
+      "comparisonExistsCalls": 0,
+      "nativeCalls": 3,
+      "portableDirectories": 0,
+      "fallbacks": 0,
+      "directoryQueueLength": 0,
+      "copyQueueLength": 0,
+      "currentScanPath": "/private/var/folders/z4/9_zv7_9959s6md0kyj22bt200000gn/T/sync-mixed-vonkg76z/target",
+      "currentScanSide": "target"
+    },
+    "durationSeconds": 0.671,
+    "dryRun": false
+  }
+}

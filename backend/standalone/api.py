@@ -254,7 +254,7 @@ def create_app(database):
                 original = old['pathMappings']
                 if len(new['pathMappings']) < len(original) or new['pathMappings'][:len(original)] != original:
                     raise HTTPException(409, '暂停任务不能删除、修改或重排已有目录组，只能追加目录组')
-                allowed = {'name', 'bandwidthLimit', 'maxRetries', 'retryInterval', 'continueOnError', 'parallelism', 'batchFiles', 'largeThresholdMb', 'networkRetryCount', 'networkRetryMinutes', 'pathMappings'}
+                allowed = {'name', 'bandwidthLimit', 'maxRetries', 'retryInterval', 'continueOnError', 'scanWorkers', 'parallelism', 'batchFiles', 'largeThresholdMb', 'networkRetryCount', 'networkRetryMinutes', 'pathMappings'}
                 if any(old[k] != new[k] for k in old.keys() - allowed):
                     raise HTTPException(409, '暂停时仅可调整限速、重试、遇错继续、并发和批量参数；同步规则需结束后修改')
                 effective = validate_task(new)
@@ -367,7 +367,9 @@ def create_app(database):
                 def mapping_emit(event):
                     emit(dict(event, mappingIndex=index, source=mapping['source'], target=mapping['target']))
                 try:
-                    mapping_emit(dict(action='mapping_started', comparisonMethod=method_name(config)))
+                    mapping_emit(dict(action='mapping_started', comparisonMethod=method_name(config),
+                                      reason=f"共享文件队列：文件并发 {config.get('parallelism', 4)}，入队批量 {config.get('batchFiles', 100)}；" +
+                                      (f"目录并发 {config.get('scanWorkers', 1)}" if config.get('syncStrategy', 'AUTO') != 'AUTO' else '兼容扫描不使用目录并发参数')))
                     summary = with_network_retry(lambda: synchronize(dict(config, **mapping, _progress=progress.update, _control=control), mapping_emit), index)
                     summaries.append(dict(summary, **mapping, mappingIndex=index))
                     mapping_emit(dict(action='mapping_completed', result=summary))

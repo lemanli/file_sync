@@ -125,11 +125,13 @@ def directory_pairs(src,dst,config,metrics,accept,onerror,check):
         queue.execute('PRAGMA journal_mode=OFF');queue.execute('PRAGMA synchronous=OFF')
         queue.execute('PRAGMA cache_size=-1024');queue.execute('CREATE TABLE queue(id INTEGER PRIMARY KEY,path BLOB)')
         queue.execute('INSERT INTO queue(path) VALUES(?)',(b'.',));queued=1
-        pool=ThreadPoolExecutor(max_workers=workers,thread_name_prefix='sync-scan')
+        pool=ThreadPoolExecutor(max_workers=32,thread_name_prefix='sync-scan')
         pending=[]
         try:
             while queued or pending:
                 check()
+                control = config.get('_control')
+                workers = max(1, min(32, (control.config if control else config).get('scanWorkers', 1)))
                 while queued and len(pending)<workers:
                     row=queue.execute('SELECT id,path FROM queue ORDER BY id LIMIT 1').fetchone()
                     queue.execute('DELETE FROM queue WHERE id=?',(row[0],));queued-=1

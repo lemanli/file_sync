@@ -59,6 +59,9 @@ class RunControl:
     def file(self, config):
         with self.condition:
             self.checkpoint(main=False)
+            while self.active >= max(1, min(32, self.config.get('parallelism', 4))):
+                self.condition.wait(.1)
+                self.checkpoint(main=False)
             defaults = {'bandwidthLimit': 0, 'maxRetries': 2, 'retryInterval': 1, 'continueOnError': False}
             for key, default in defaults.items():
                 config[key] = self.config.get(key, config.get(key, default))
@@ -68,6 +71,7 @@ class RunControl:
         finally:
             with self.condition:
                 self.active -= 1
+                self.condition.notify_all()
                 if self.requested and self.acknowledged and not self.active and not self.closed:
                     self._set('paused')
 

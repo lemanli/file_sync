@@ -9,7 +9,7 @@ import tempfile
 import time
 import threading
 from contextlib import contextmanager, nullcontext, closing
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import wait, FIRST_COMPLETED
 from pathlib import Path
 from .rules import IgnoreRules
 from .comparison import compare, metadata, method_name, tolerance_ns
@@ -471,7 +471,11 @@ def _synchronize_one(config, emit):
 
     progress('phase', phase='syncing')
     seen_files, seen_directories = set(), set()
-    with ThreadPoolExecutor(max_workers=parallelism) as pool:
+    from .copy_pool import CopyPool
+    def runtime_settings():
+        control = config.get('_control')
+        return control.config if control else config
+    with CopyPool(lambda: max(1, min(32, runtime_settings().get('parallelism', 4)))) as pool:
         pending, small = set(), []
         try:
             walker = planned_walk() if optimized else os.walk(src, onerror=walk_error)
@@ -508,8 +512,12 @@ def _synchronize_one(config, emit):
                         seen_files.add(relative)
                     result['scanned'] += 1
                     progress('discovered')
+                    settings = runtime_settings()
+                    parallelism = max(1, min(32, settings.get('parallelism', 4)))
+                    batch_size = max(1, min(1000, settings.get('batchFiles', 100)))
+                    threshold = settings.get('largeThresholdMb', 512) * 1024 * 1024
                     try:
-                        is_large = False if optimized else (src / relative).stat().st_size >= threshold
+                        is_large = (name[1].size is not None and name[1].size >= threshold) if optimized else (src / relative).stat().st_size >= threshold
                     except OSError as error:
                         raise_network(error)
                         if not config.get('continueOnError'):
@@ -518,7 +526,7 @@ def _synchronize_one(config, emit):
                         progress('file_done')
                         continue
                     if is_large:
-                        pending.add(pool.submit(batch, [work_item]))
+                        pending.add(pool.submit(batch, [work_item], priority=True))
                     else:
                         small.append(work_item)
                         if len(small) >= batch_size:
