@@ -23,6 +23,7 @@ class Progress:
         self.sample_window = self.started
         self.sample_count = 0
         self.scan_metrics = {}
+        self.path_check_metrics = {}
         self.samples = [(self.started, 0, 0, 0)]
 
     def _record_phase(self, identity, current):
@@ -45,7 +46,7 @@ class Progress:
             self.slow_files.clear()
         return dict(phaseTimings=snapshot['phaseTimings'], slowFiles=samples,
                     activeFiles=snapshot['activeFiles'], counts=snapshot['counts'],
-                    elapsedSeconds=snapshot['elapsedSeconds'], scanMetrics=snapshot['scanMetrics'])
+                    elapsedSeconds=snapshot['elapsedSeconds'], scanMetrics=snapshot['scanMetrics'], pathCheckMetrics=snapshot['pathCheckMetrics'])
 
     def update(self, kind, **data):
         with self.lock:
@@ -57,6 +58,9 @@ class Progress:
                 self.scan_complete = False
                 self.active.clear()
                 self.file_timings.clear()
+            elif kind == 'path_metrics':
+                for key, value in data.items():
+                    self.path_check_metrics[key] = self.path_check_metrics.get(key, 0) + value
             elif kind == 'metrics':
                 self.scan_metrics = dict(data)
             elif kind == 'scan':
@@ -115,6 +119,7 @@ class Progress:
             seconds = max(current - first[0], .001)
             return dict(phaseTimings={key:dict(value) for key,value in self.phase_totals.items()},
                         scanMetrics=dict(self.scan_metrics),
+                        pathCheckMetrics=dict(self.path_check_metrics),
                         sourceScanRate=self.scan_metrics.get('sourceEntries',0)/max(current-self.started,.001),
                         targetScanRate=self.scan_metrics.get('targetEntries',0)/max(current-self.started,.001),
                         directoriesPerSecond=(self.scan_metrics.get('sourceDirectories',0)+self.scan_metrics.get('targetDirectories',0))/max(current-self.started,.001),

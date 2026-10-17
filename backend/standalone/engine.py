@@ -15,6 +15,7 @@ from .rules import IgnoreRules
 from .comparison import compare, metadata, method_name, tolerance_ns
 from .scanning import scan_tree
 from .recovery import network_error, NetworkUnavailable
+from .path_attributes import windows_link, link_info
 
 
 class UnsafePathError(RuntimeError):
@@ -29,18 +30,11 @@ def digest(path):
     return value.digest()
 
 
-def windows_link(path):
-    # 一次不跟随链接的属性读取，同时识别符号链接和目录联接。
-    try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return False
-    return stat.S_ISLNK(info.st_mode) or getattr(info, 'st_reparse_tag', 0) == 0xA0000003
-
-
-def is_link(path):
+def is_link(path, counts=None):
     if os.name == 'nt':
-        return windows_link(path)
+        return windows_link(path, counts)
+    if counts is not None:
+        counts['portableLinkChecks'] = counts.get('portableLinkChecks', 0) + 1
     return path.is_symlink() or (hasattr(path,'is_junction') and path.is_junction())
 
 
@@ -128,17 +122,37 @@ def _synchronize_one(config, emit):
         if not valid:
             raise UnsafePathError('源目录已失效或被替换，终止同步及删除')
     def check_target(path):
-        if any(is_link(p) for p in (path, *path.parents)):
-            raise UnsafePathError(f'目标路径出现符号链接：{path}')
-        if target_identity is not None:
-            try:
-                current = dst.stat()
-                valid = stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == target_identity
-            except OSError as error:
-                raise_network(error)
-                valid = False
-            if not valid:
-                raise UnsafePathError('目标根目录已失效或被替换，终止同步及删除')
+        counts = dict(targetChecks=1)
+        current = None
+        try:
+            for candidate in (path, *path.parents):
+                # Windows 根目录的同一次 lstat 同时提供链接类型与身份，避免重复查询。
+                if os.name == 'nt' and candidate == dst and target_identity is not None:
+                    counts['rootIdentityQueries'] = 1
+                    counts['lstatQueries'] = counts.get('lstatQueries', 0) + 1
+                    try:
+                        current = dst.lstat()
+                    except OSError as error:
+                        raise_network(error)
+                        raise UnsafePathError('目标根目录已失效或被替换，终止同步及删除') from error
+                    linked = link_info(current)
+                else:
+                    linked = is_link(candidate, counts)
+                if linked:
+                    raise UnsafePathError(f'目标路径出现符号链接：{path}')
+            if target_identity is not None:
+                try:
+                    if current is None:
+                        counts['rootIdentityQueries'] = 1
+                        current = dst.stat()
+                    valid = stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == target_identity
+                except OSError as error:
+                    raise_network(error)
+                    valid = False
+                if not valid:
+                    raise UnsafePathError('目标根目录已失效或被替换，终止同步及删除')
+        finally:
+            config.get('_progress', lambda *args, **kwargs: None)('path_metrics', **counts)
     def check_stop():
         if stop.is_set():
             if network_failure:
@@ -397,10 +411,12 @@ def _synchronize_one(config, emit):
                     check_stop()
                     progress('file', path=str(relative), size=before.st_size, written=written, phase='renaming')
                     if optimized and config['syncStrategy']=='SKIP_EXISTING':
-                        from .publication import publish_if_absent
-                        if not publish_if_absent(temp,target):
+                        from .publication import publish_if_absent, Publication
+                        publication = publish_if_absent(temp,target)
+                        if not publication:
                             return dict(path=str(relative),action='skipped',bytes=0,
                                         reason='目标在目录枚举后出现，原子不覆盖发布已保留该目标')
+                        replaced = publication == Publication.RENAMED
                     else:
                         os.replace(temp, target)
                         replaced = True

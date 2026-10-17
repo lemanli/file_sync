@@ -42,7 +42,8 @@ class PublishOverheadTests(unittest.TestCase):
         from standalone.engine import windows_link
         for mode,tag,expected in ((stat.S_IFDIR,0,False),(stat.S_IFLNK,0,True),(stat.S_IFDIR,0xA0000003,True)):
             path=SimpleNamespace(lstat=Mock(return_value=SimpleNamespace(st_mode=mode,st_reparse_tag=tag)))
-            self.assertEqual(windows_link(path),expected)
+            with patch('standalone.path_attributes._get_attributes', None):
+                self.assertEqual(windows_link(path),expected)
             path.lstat.assert_called_once()
 
     def test_debug_log_is_saved_and_filterable(self):
