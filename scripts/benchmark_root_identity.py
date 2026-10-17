@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import time
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'backend'))
-from standalone.root_identity import root_stat
+from standalone.root_identity import root_stat, RootIdentityReader
 
 
 def main():
@@ -25,7 +25,10 @@ def main():
     records=[]
     for workers in args.workers:
         for turn in range(args.rounds):
-            methods=[('python_lstat',lambda counts:root.lstat()),('native_identity',lambda counts:root_stat(root,counts))]
+            adaptive=RootIdentityReader()
+            methods=[('python_lstat',lambda counts:root.lstat()),
+                     ('native_identity',lambda counts:root_stat(root,counts)),
+                     ('adaptive_identity',lambda counts:adaptive(root,counts))]
             for name,query in methods[::1 if turn%2==0 else -1]:
                 def batch(count):
                     counters={}

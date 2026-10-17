@@ -17,6 +17,19 @@ class FileIdentity(C.Structure):
     _fields_ = [('volume', C.c_uint64), ('identity', C.c_ubyte * 16)]
 
 
+class LegacyInformation(C.Structure):
+    # FILETIME 是两个 DWORD，不能用会改变结构对齐的 uint64 替代。
+    _fields_ = [('attributes', C.c_uint32), ('created', C.c_uint32 * 2),
+                ('accessed', C.c_uint32 * 2), ('modified', C.c_uint32 * 2),
+                ('volume', C.c_uint32), ('size_high', C.c_uint32),
+                ('size_low', C.c_uint32), ('links', C.c_uint32),
+                ('index_high', C.c_uint32), ('index_low', C.c_uint32)]
+
+
+class NativeIdentityUnavailable(Exception):
+    """接口或身份格式不可用；不代表网络错误或安全检查通过。"""
+
+
 last_error = getattr(C, 'get_last_error', lambda: 0)
 win_error = getattr(C, 'WinError', lambda code: OSError(code, 'Windows API 查询失败'))
 _api = None
@@ -33,7 +46,10 @@ if os.name == 'nt' and sys.version_info >= (3, 12):
     close_call = kernel.CloseHandle
     close_call.argtypes = [W.HANDLE]
     close_call.restype = W.BOOL
-    _api = SimpleNamespace(open=open_call, info=info_call, close=close_call)
+    legacy_call = kernel.GetFileInformationByHandle
+    legacy_call.argtypes = [W.HANDLE, C.POINTER(LegacyInformation)]
+    legacy_call.restype = W.BOOL
+    _api = SimpleNamespace(open=open_call, info=info_call, close=close_call, legacy=legacy_call)
 
 
 def native_path(path):
@@ -101,21 +117,121 @@ def root_stat(path, counts=None):
     return fallback(fallback_stage, fallback_code) if unsupported else result
 
 
+def legacy_root_stat(path, counts=None, capabilities=None):
+    """兼容查询取得属性；保留可用的完整身份，仅在接口不支持时采用 64 位身份。"""
+    if capabilities is None:
+        capabilities = {}
+    def unavailable(stage, code=0):
+        increment(counts, 'rootLegacyUnavailable')
+        increment(counts, 'rootLegacyFailure'+stage[0].upper()+stage[1:])
+        if code:
+            increment(counts, 'rootLegacyError'+str(code))
+        sample(counts, path, 'identityBackend', 'targetRoot', 0,
+               reason='legacy_root_unavailable', stage=stage, winError=code)
+        raise NativeIdentityUnavailable(stage)
+    if _api is None:
+        unavailable('platform')
+    increment(counts, 'rootLegacyQueries')
+    handle = _api.open(native_path(path), 0x80, 3, None, 3, 0x02200000, None)
+    if handle == C.c_void_p(-1).value or handle is None:
+        code = last_error()
+        if code in (1, 5, 32, 50, 87, 120):
+            unavailable('open', code)
+        raise win_error(code)
+    try:
+        value = LegacyInformation()
+        if not _api.legacy(handle, C.byref(value)):
+            code = last_error()
+            if code in (1, 5, 32, 50, 87, 120):
+                unavailable('query', code)
+            raise win_error(code)
+        tag = 0
+        if value.attributes & 0x400:
+            tagged = AttributeTag()
+            if not _api.info(handle, 9, C.byref(tagged), C.sizeof(tagged)):
+                code = last_error()
+                if code in (1, 5, 32, 50, 87, 120):
+                    unavailable('reparse', code)
+                raise win_error(code)
+            tag = tagged.tag
+            if tag not in (0xA0000003, 0xA000000C):
+                unavailable('reparse')
+        inode = (value.index_high << 32) | value.index_low
+        volume = value.volume
+        # ReFS 等系统的 64 位编号不保证唯一。只要完整身份接口可用，就不能降为 64 位。
+        if capabilities.get('id128', True):
+            full = FileIdentity()
+            increment(counts, 'rootCompatId128Queries')
+            if _api.info(handle, 18, C.byref(full), C.sizeof(full)):
+                inode = int.from_bytes(bytes(full.identity), 'little')
+                volume = full.volume
+            else:
+                code = last_error()
+                if code not in (1, 50, 87, 120):
+                    raise win_error(code)
+                capabilities['id128'] = False
+                increment(counts, 'rootCompatId128Unsupported')
+                increment(counts, 'rootCompatId128Error'+str(code))
+        if not inode or not volume:
+            unavailable('incomplete')
+        mode = stat.S_IFDIR if value.attributes & 0x10 else stat.S_IFREG
+        if tag == 0xA000000C:
+            mode = stat.S_IFLNK
+        return SimpleNamespace(st_dev=volume, st_ino=inode,
+                               st_mode=mode, st_reparse_tag=tag)
+    finally:
+        if not _api.close(handle):
+            raise win_error(last_error())
+
+
 class RootIdentityReader:
-    """每个目录组独立选择查询方式；只记兼容性，不缓存任何目录身份。"""
-    def __init__(self, native=None):
+    """每组选择查询接口；身份不缓存，兼容接口先与完整查询结果校准。"""
+    def __init__(self, native=None, legacy=None):
         self.native = native or root_stat
+        self.capabilities = {}
+        selected = legacy if legacy is not None else (legacy_root_stat if native is None else None)
+        self.legacy = (lambda path, counts: legacy_root_stat(path, counts, self.capabilities)) if selected is legacy_root_stat else selected
         self.mode = None
         self.probe_lock = threading.Lock()
+        self.compat_lock = threading.Lock()
+        self.compat_tried = False
+
+    @staticmethod
+    def _identity(info):
+        return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode),
+                getattr(info, 'st_reparse_tag', 0))
+
+    def _calibrate(self, path, counts, baseline):
+        if self.legacy is None or self.compat_tried:
+            return baseline
+        with self.compat_lock:
+            if self.compat_tried:
+                return baseline
+            self.compat_tried = True
+            try:
+                current = self.legacy(path, counts)
+            except NativeIdentityUnavailable:
+                return baseline
+            # 必须比较完整整数，不能将 128 位 inode 或卷身份截断后接受。
+            if (baseline.st_ino and baseline.st_dev and
+                    self._identity(current) == self._identity(baseline)):
+                self.mode = 'legacy'
+                increment(counts, 'rootLegacySelected')
+                return current
+            increment(counts, 'rootLegacyMismatch')
+            # 不匹配可能是目录发生变化；重新使用完整查询，交由原安全判断处理。
+            increment(counts, 'lstatQueries')
+            return path.lstat()
 
     def _native(self, path, counts):
         previous = counts.get('rootNativeFallbacks', 0)
         try:
             result = self.native(path, counts)
         finally:
-            if counts.get('rootNativeFallbacks', 0) > previous:
+            if counts.get('rootNativeFallbacks', 0) > previous and self.mode != 'legacy':
                 self.mode = False
-        # 另一线程可能已发现不兼容，不能被较早启动的成功查询重新启用。
+        if counts.get('rootNativeFallbacks', 0) > previous:
+            return self._calibrate(path, counts, result)
         if self.mode is None:
             self.mode = True
         return result
@@ -124,13 +240,16 @@ class RootIdentityReader:
         if counts is None:
             counts = {}
         if self.mode is None:
-            # 首次只让一个线程探测，避免 32 个 worker 同时重复失败。
             with self.probe_lock:
                 if self.mode is None:
                     return self._native(path, counts)
+        if self.mode == 'legacy':
+            try:
+                return self.legacy(path, counts)
+            except NativeIdentityUnavailable:
+                self.mode = False
         if self.mode is False:
             increment(counts, 'rootNativeBypassed')
             increment(counts, 'lstatQueries')
             return path.lstat()
-        # 正常核验与回退 lstat 均不持有探测锁，独立文件继续并行。
         return self._native(path, counts)
