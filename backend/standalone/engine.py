@@ -17,6 +17,7 @@ from .scanning import scan_tree
 from .recovery import network_error, NetworkUnavailable
 from .path_attributes import windows_link, link_info, query
 from .root_identity import root_stat, legacy_root_stat, RootIdentityReader
+from .copy_metadata import CopyMetadataReader
 
 
 class UnsafePathError(RuntimeError):
@@ -105,6 +106,7 @@ def _synchronize_one(config, emit):
     target_info = dst.stat() if dst.exists() else None
     target_identity = (target_info.st_dev, target_info.st_ino) if target_info else None
     root_reader = RootIdentityReader(root_stat, legacy=legacy_root_stat)
+    copy_metadata = CopyMetadataReader()
     stop = threading.Event()
     from .file_locks import FilePublishLocks
     publish_locks = FilePublishLocks()
@@ -377,7 +379,11 @@ def _synchronize_one(config, emit):
                 after = source.stat()
                 if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
                     raise RuntimeError(f'复制期间源文件发生变化：{relative}')
-                if temp.stat().st_size != before.st_size:
+                written_stat = copy_metadata(temp)
+                if written_stat.st_size != before.st_size:
+                    # 异常长度用完整查询复核，避免属性缓存造成误报。
+                    written_stat = temp.stat()
+                if written_stat.st_size != before.st_size:
                     raise RuntimeError(f'文件长度不一致：{relative}')
                 if method_name(config) == 'sha256':
                     progress('file', path=str(relative), size=before.st_size, written=written, phase='verifying')
@@ -387,16 +393,19 @@ def _synchronize_one(config, emit):
                     verification = dict(sourceSha256=source_hash, writtenSha256=written_hash)
                     detail['source']['sha256'] = source_hash
                 progress('file', path=str(relative), size=before.st_size, written=written, phase='metadata')
-                written_stat = temp.stat()
                 # 仅复制权限；时间在下方按任务配置单独写入并校验。
                 # copystat 还会复制 BSD 标志，macOS 文件同步到 SMB 时可能报 EINVAL。
                 shutil.copymode(source, temp)
                 preserve = config.get('preserveTime', True)
                 # 使用复制前快照；读取源文件可能改变访问时间。
-                times = (before.st_atime_ns, before.st_mtime_ns) if preserve else (written_stat.st_atime_ns, written_stat.st_mtime_ns)
-                os.utime(temp, ns=times)
-                stored_mtime = temp.stat().st_mtime_ns
+                if preserve:
+                    os.utime(temp, ns=(before.st_atime_ns, before.st_mtime_ns))
+                # 不保留源时间时，沿用实际写入时间，无需把同一时间再写回。
+                stored_mtime = copy_metadata(temp).st_mtime_ns
                 difference = abs(stored_mtime - before.st_mtime_ns)
+                if preserve and difference > tolerance_ns(config):
+                    stored_mtime = temp.stat().st_mtime_ns
+                    difference = abs(stored_mtime - before.st_mtime_ns)
                 timestamps = dict(preserved=preserve, sourceMtimeNs=str(before.st_mtime_ns),
                                   targetMtimeNs=str(stored_mtime), differenceNs=str(difference),
                                   toleranceSeconds=tolerance_ns(config)/1_000_000_000,
