@@ -9,6 +9,7 @@ class ScanFields(IntFlag):
     SIZE = 4
     MTIME = 8
     NAME_TYPE = NAME | TYPE
+    NAME_TYPE_SIZE = NAME | TYPE | SIZE
     METADATA = NAME | TYPE | SIZE | MTIME
 
 @dataclass(frozen=True, slots=True)

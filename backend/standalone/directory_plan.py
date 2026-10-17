@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
 import unicodedata
 from .scanner import get_scanner, ScanFields, DirectoryEntry, UnsupportedScanner
 from .scanner.portable import PortableScanner
@@ -15,9 +16,32 @@ def alias(name):
     return unicodedata.normalize('NFD', name).casefold()
 
 
+class SnapshotBudget:
+    """共享估算预算；不等同进程 RSS，预留字典、别名及 Python 对象开销。"""
+    def __init__(self, maximum, metrics):
+        self.maximum = maximum
+        self.used = self.peak = 0
+        self.lock = threading.Lock()
+        self.metrics = metrics
+    def reserve(self, amount):
+        with self.lock:
+            if self.used + amount > self.maximum:
+                return False
+            self.used += amount
+            self.peak = max(self.peak, self.used)
+            self.metrics.set('snapshotMemoryEstimatedBytes', self.used)
+            self.metrics.set('snapshotMemoryPeakEstimatedBytes', self.peak)
+            return True
+    def release(self, amount):
+        with self.lock:
+            self.used -= amount
+            self.metrics.set('snapshotMemoryEstimatedBytes', self.used)
+
+
 class Snapshot:
     """小目录内存哈希；超限后落盘，防止千万条目录项占满内存。"""
-    def __init__(self, limit=10000, reject_aliases=False):
+    def __init__(self, limit=10000, reject_aliases=False, budget=None):
+        self.budget=budget; self.reserved=0
         self.reject_aliases=reject_aliases
         self.limit=limit; self.items={}; self.aliases={}; self.db=None; self.temp=None
     def add(self, entry):
@@ -28,18 +52,28 @@ class Snapshot:
                 previous=os.fsdecode(row[0]) if row else None
             if previous is not None and previous!=entry.name:
                 raise ValueError('源目录存在大小写或 Unicode 等价名称，无法安全映射目标：'+previous+' / '+entry.name)
+        if self.db is None and self.budget is not None:
+            cost=1024+len(entry.name)*8
+            if self.budget.reserve(cost): self.reserved+=cost
+            else: self._spill()
         if self.db is None and len(self.items)>=self.limit:
-            self.temp=tempfile.TemporaryDirectory(prefix='file-sync-scan-')
-            self.db=sqlite3.connect(str(Path(self.temp.name)/'entries.sqlite'),check_same_thread=False)
-            self.db.execute('PRAGMA journal_mode=OFF');self.db.execute('PRAGMA synchronous=OFF')
-            self.db.execute('PRAGMA cache_size=-2048')
-            self.db.execute('CREATE TABLE entries(name BLOB PRIMARY KEY, alias BLOB, detail TEXT)')
-            self.db.execute('CREATE INDEX aliases ON entries(alias)')
-            for old in self.items.values():self._insert(old)
-            self.items.clear();self.aliases.clear()
+            self._spill()
         if self.db is None:
             self.items[entry.name]=entry;self.aliases[alias(entry.name)]=entry.name
         else:self._insert(entry)
+    def _spill(self):
+        self.temp=tempfile.TemporaryDirectory(prefix='file-sync-scan-')
+        self.db=sqlite3.connect(str(Path(self.temp.name)/'entries.sqlite'),check_same_thread=False)
+        self.db.execute('PRAGMA journal_mode=OFF');self.db.execute('PRAGMA synchronous=OFF')
+        self.db.execute('PRAGMA cache_size=-2048')
+        self.db.execute('CREATE TABLE entries(name BLOB PRIMARY KEY, alias BLOB, detail TEXT)')
+        self.db.execute('CREATE INDEX aliases ON entries(alias)')
+        for old in self.items.values():self._insert(old)
+        self.items.clear();self.aliases.clear()
+        if self.budget is not None:
+            self.budget.release(self.reserved);self.reserved=0
+            self.budget.metrics.add('snapshotSpills')
+
     def _insert(self, entry):
         self.db.execute('INSERT OR REPLACE INTO entries VALUES(?,?,?)',
                         (os.fsencode(entry.name),os.fsencode(alias(entry.name)),json.dumps([entry.name,entry.kind,entry.size,entry.mtime_ns])))
@@ -59,16 +93,19 @@ class Snapshot:
         else:
             for row in self.db.execute('SELECT detail FROM entries'):yield DirectoryEntry(*json.loads(row[0]))
     def close(self):
+        self.items.clear();self.aliases.clear()
+        if self.budget is not None:
+            self.budget.release(self.reserved);self.reserved=0
         if self.db is not None:self.db.close();self.db=None
         if self.temp is not None:self.temp.cleanup();self.temp=None
     def __enter__(self):return self
     def __exit__(self,*args):self.close()
 
 
-def read_snapshot(path,fields,backend,metrics,side,limit=10000,check=lambda:None):
+def read_snapshot(path,fields,backend,metrics,side,limit=10000,check=lambda:None,budget=None):
     scanner=get_scanner(backend)
     while True:
-        result=Snapshot(limit,reject_aliases=side=='source')
+        result=Snapshot(limit,reject_aliases=side=='source',budget=budget)
         count=0
         try:
             # 不跟随扫描期间被替换的目录链接；发布时仍再次复核。
@@ -94,10 +131,11 @@ def read_snapshot(path,fields,backend,metrics,side,limit=10000,check=lambda:None
 def directory_pairs(src,dst,config,metrics,accept,onerror,check):
     """并发单位为目录，磁盘目录队列+至多 workers 个在途快照。"""
     strategy=config['syncStrategy']
-    fields=ScanFields.NAME_TYPE if strategy in ('COPY_ALL','SKIP_EXISTING') else ScanFields.METADATA
+    fields=ScanFields.NAME_TYPE if strategy in ('COPY_ALL','SKIP_EXISTING') else ScanFields.NAME_TYPE_SIZE if strategy=='COMPARE_SIZE' else ScanFields.METADATA
     workers=config.get('scanWorkers',1)
     backend=config.get('scannerBackend','auto')
-    limit=config.get('_snapshotLimit',10000)
+    limit=config.get('_snapshotLimit',float('inf'))
+    budget=SnapshotBudget(config.get('scanMemoryMb',256)*1024*1024,metrics)
     def scan(relative):
         source=target=None
         try:
@@ -107,11 +145,11 @@ def directory_pairs(src,dst,config,metrics,accept,onerror,check):
                 if control and control.closed:
                     from .control import RunInterrupted
                     raise RunInterrupted('任务已停止')
-            source=read_snapshot(src/relative,fields,backend,metrics,'source',limit,cancelled)
+            source=read_snapshot(src/relative,fields,backend,metrics,'source',limit,cancelled,budget)
             target=Snapshot(limit)
             if strategy!='COPY_ALL':
                 try:
-                    target=read_snapshot(dst/relative,fields,backend,metrics,'target',limit,cancelled)
+                    target=read_snapshot(dst/relative,fields,backend,metrics,'target',limit,cancelled,budget)
                 except FileNotFoundError as error:
                     from .recovery import network_error
                     if network_error(error):raise

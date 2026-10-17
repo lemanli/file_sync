@@ -1,0 +1,22 @@
+{
+  "files": 100000,
+  "seconds": 27.55897220794577,
+  "filesPerSecond": 3628.582344996455,
+  "targetFilePathStatCalls": 300000,
+  "scanMemoryMb": 256,
+  "result": {
+    "copied": 0,
+    "skipped": 100000,
+    "deleted": 0,
+    "bytes": 0,
+    "scanned": 100000,
+    "unsupportedSkipped": 0,
+    "ignored": 0,
+    "failed": 0,
+    "conflicts": 0,
+    "deletionSkipped": false,
+    "durationSeconds": 27.5476,
+    "dryRun": false
+  },
+  "processPeakRssBytes": 81526784
+}

@@ -72,6 +72,8 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   await page.locator('.mapping').last().getByRole('button',{name:'移除'}).click();
   // 离开未保存表单时可以取消，不丢失输入。
   page.once('dialog',dialog=>dialog.dismiss());await page.locator('#tab-tasks').click();assert(await page.locator('#panel-editor').isVisible());
+  await page.locator('#syncStrategy').selectOption('COMPARE_SIZE');assert.equal(await page.locator('#comparisonMethod').inputValue(),'size');
+  await page.locator('[name=scanMemoryMb]').fill('1024');
   await page.locator('#syncStrategy').selectOption('COPY_ALL');assert(await page.locator('#comparisonMethod').isDisabled());assert(await page.locator('#syncDirection').isDisabled());
   await page.locator('#rulePreset').selectOption('mirror');await page.locator('#applyPreset').click();assert(await page.locator('input[name=delete]').isChecked());assert.equal(await page.locator('#syncStrategy').inputValue(),'AUTO');assert(!(await page.locator('#comparisonMethod').isDisabled()));
   await page.locator('#rulePreset').selectOption('merge');await page.locator('#applyPreset').click();assert.equal(await page.locator('#syncDirection').inputValue(),'bidirectional');assert(await page.locator('input[name=delete]').isDisabled());

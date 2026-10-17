@@ -60,7 +60,7 @@ def roots(source, target):
 def synchronize(config, emit):
     config = dict(config)
     strategy = config.get('syncStrategy', 'AUTO')
-    if strategy not in ('AUTO','COPY_ALL','SKIP_EXISTING','COMPARE_METADATA','MIRROR'):
+    if strategy not in ('AUTO','COPY_ALL','SKIP_EXISTING','COMPARE_SIZE','COMPARE_METADATA','MIRROR'):
         raise ValueError('未知同步策略')
     if strategy != 'AUTO':
         if config.get('direction') == 'bidirectional':
@@ -68,11 +68,14 @@ def synchronize(config, emit):
         if config.get('updateOnly') or (config.get('delete') and strategy != 'MIRROR'):
             raise ValueError('新策略不能组合仅更新或独立删除选项')
         config['delete'] = strategy == 'MIRROR'
-        config['comparisonMode'] = 'size_mtime'
+        config['comparisonMode'] = 'size' if strategy == 'COMPARE_SIZE' else 'size_mtime'
         config['checksum'] = False
     if config.get("direction") == "bidirectional":
         from .two_way import synchronize_two_way
         return synchronize_two_way(config, emit)
+    from .strategy import effective_strategy
+    strategy = effective_strategy(config)
+    config['syncStrategy'] = strategy
     if strategy != 'AUTO':
         from .directory_plan import SpillSet
         from contextlib import ExitStack
@@ -266,7 +269,7 @@ def _synchronize_one(config, emit):
             if scanned_target and not scanned_target.is_file:
                 raise ValueError(f'目标类型冲突：{relative}')
             if config['syncStrategy'] != 'SKIP_EXISTING':
-                equal, detail = compare(src/relative,dst/relative,left,right,'size_mtime',digest,tolerance_ns(config))
+                equal, detail = compare(src/relative,dst/relative,left,right,'size' if config['syncStrategy']=='COMPARE_SIZE' else 'size_mtime',digest,tolerance_ns(config))
                 if equal:
                     return dict(path=str(relative),action='skipped',bytes=0,comparison=detail,reason=detail['reason'])
 
@@ -309,7 +312,8 @@ def _synchronize_one(config, emit):
         if equal:
             return dict(path=str(relative), action='skipped', bytes=0, comparison=detail, reason=detail['reason'])
         if not dry:
-            target.parent.mkdir(parents=True, exist_ok=True)
+            if not optimized:
+                target.parent.mkdir(parents=True, exist_ok=True)
             fd, temp_name = tempfile.mkstemp(prefix='.sync-', dir=target.parent)
             temp = Path(temp_name)
             try:

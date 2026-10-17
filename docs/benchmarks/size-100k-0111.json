@@ -1,0 +1,40 @@
+{
+  "files": 100000,
+  "seconds": 2.761818957980722,
+  "filesPerSecond": 36208.021424081344,
+  "targetFilePathStatCalls": 0,
+  "scanMemoryMb": 256,
+  "result": {
+    "copied": 0,
+    "skipped": 100000,
+    "deleted": 0,
+    "bytes": 0,
+    "scanned": 100000,
+    "unsupportedSkipped": 0,
+    "ignored": 0,
+    "failed": 0,
+    "conflicts": 0,
+    "deletionSkipped": false,
+    "scanMetrics": {
+      "sourceEntries": 100000,
+      "targetEntries": 100000,
+      "sourceDirectories": 1,
+      "targetDirectories": 1,
+      "metadataCalls": 0,
+      "extraStatCount": 0,
+      "comparisonExistsCalls": 0,
+      "nativeCalls": 46,
+      "portableDirectories": 0,
+      "fallbacks": 0,
+      "directoryQueueLength": 0,
+      "copyQueueLength": 0,
+      "currentScanPath": "/private/var/folders/z4/9_zv7_9959s6md0kyj22bt200000gn/T/sync-size-benchmark-zuhv8w45/target",
+      "currentScanSide": "target",
+      "snapshotMemoryEstimatedBytes": 0,
+      "snapshotMemoryPeakEstimatedBytes": 212622240
+    },
+    "durationSeconds": 2.7509,
+    "dryRun": false
+  },
+  "processPeakRssBytes": 115736576
+}

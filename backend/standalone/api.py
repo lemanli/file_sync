@@ -18,6 +18,7 @@ from .engine import roots, synchronize
 from .folders import list_directories
 from .rules import validate_patterns
 from .comparison import method_name
+from .strategy import effective_strategy
 from . import __version__
 from .progress import Progress
 from .preflight import check_destination
@@ -60,15 +61,16 @@ class Task(BaseModel):
             if self.updateOnly or (self.delete and self.syncStrategy != 'MIRROR'):
                 raise ValueError('新策略不能组合仅更新或独立删除选项')
             self.delete = self.syncStrategy == 'MIRROR'
-            self.comparisonMode = 'size_mtime'
+            self.comparisonMode = 'size' if self.syncStrategy == 'COMPARE_SIZE' else 'size_mtime'
             self.checksum = False
         validate_patterns(self.ignorePatterns)
         if self.direction == 'bidirectional' and self.delete:
             raise ValueError('双向合并不支持删除，请关闭删除选项')
         return self
     direction: Literal['one_way', 'bidirectional'] = 'one_way'
-    syncStrategy: Literal['AUTO', 'COPY_ALL', 'SKIP_EXISTING', 'COMPARE_METADATA', 'MIRROR'] = 'AUTO'
+    syncStrategy: Literal['AUTO', 'COPY_ALL', 'SKIP_EXISTING', 'COMPARE_SIZE', 'COMPARE_METADATA', 'MIRROR'] = 'AUTO'
     scanWorkers: int = Field(default=1, ge=1, le=32)
+    scanMemoryMb: int = Field(default=256, ge=16, le=16384)
     scannerBackend: Literal['auto','portable','macos','linux','windows_bulk','windows_find'] = 'auto'
     conflictPolicy: Literal['skip', 'newer'] = 'skip'
     ignorePatterns: list[str] = Field(default_factory=list, max_length=200)
@@ -214,7 +216,7 @@ def create_app(database):
 
     @app.get('/api/health')
     def health():
-        return {'releaseVersion': __version__, 'mode': 'standalone', 'database': 'sqlite', 'version': 1, 'configSchemaVersion': 3, 'taskControlVersion': 1, 'networkRecoveryVersion': 1, 'scanArchitectureVersion': 1, 'comparisonDetailsVersion': 1, 'timeOptionsVersion': 1, 'progressVersion': 1, 'logQueryVersion': 1}
+        return {'releaseVersion': __version__, 'mode': 'standalone', 'database': 'sqlite', 'version': 1, 'configSchemaVersion': 4, 'taskControlVersion': 1, 'networkRecoveryVersion': 1, 'scanArchitectureVersion': 1, 'comparisonDetailsVersion': 1, 'timeOptionsVersion': 1, 'progressVersion': 1, 'logQueryVersion': 1}
 
     @app.get('/api/tasks')
     def tasks():
@@ -369,7 +371,7 @@ def create_app(database):
                 try:
                     mapping_emit(dict(action='mapping_started', comparisonMethod=method_name(config),
                                       reason=f"共享文件队列：文件并发 {config.get('parallelism', 4)}，入队批量 {config.get('batchFiles', 100)}；" +
-                                      (f"目录并发 {config.get('scanWorkers', 1)}" if config.get('syncStrategy', 'AUTO') != 'AUTO' else '兼容扫描不使用目录并发参数')))
+                                      (f"目录并发 {config.get('scanWorkers', 1)}" if effective_strategy(config) != 'AUTO' else '兼容扫描不使用目录并发参数')))
                     summary = with_network_retry(lambda: synchronize(dict(config, **mapping, _progress=progress.update, _control=control), mapping_emit), index)
                     summaries.append(dict(summary, **mapping, mappingIndex=index))
                     mapping_emit(dict(action='mapping_completed', result=summary))

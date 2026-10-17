@@ -15,7 +15,7 @@ def tolerance_ns(config):
 
 def metadata(size, mtime_ns):
     # 纳秒用字符串存储，避免浏览器 Number 损失精度。
-    return dict(size=size, mtimeNs=str(mtime_ns))
+    return dict(size=size, mtimeNs=str(mtime_ns) if mtime_ns is not None else None)
 
 
 def compare(source, target, left, right, mode, digest, tolerance=0):
