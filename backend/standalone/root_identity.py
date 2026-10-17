@@ -4,8 +4,9 @@ import os
 import ntpath
 import stat
 import sys
+import threading
 from types import SimpleNamespace
-from .path_attributes import increment
+from .path_attributes import increment, sample
 
 
 class AttributeTag(C.Structure):
@@ -47,12 +48,17 @@ def native_path(path):
 
 
 def root_stat(path, counts=None):
-    def fallback():
+    def fallback(stage, code=0):
         increment(counts, 'rootNativeFallbacks')
+        increment(counts, 'rootFallback'+stage[0].upper()+stage[1:])
+        if code:
+            increment(counts, 'rootFallbackError'+str(code))
+        sample(counts, path, 'identityBackend', 'targetRoot', 0,
+               reason='native_root_fallback', stage=stage, winError=code)
         increment(counts, 'lstatQueries')
         return path.lstat()
     if _api is None:
-        return fallback()
+        return fallback('unavailable')
     increment(counts, 'rootNativeQueries')
     # FILE_READ_ATTRIBUTES；允许并行读写，不允许核验期间删除/重命名根目录。
     # BACKUP_SEMANTICS | OPEN_REPARSE_POINT：打开目录且不跟随根目录链接。
@@ -61,9 +67,10 @@ def root_stat(path, counts=None):
         code = last_error()
         if code in (1, 5, 32, 50, 87, 120):
             # 保留 Python 对权限/共享限制的兼容处理；回退也必须返回真实身份。
-            return fallback()
+            return fallback('open', code)
         raise win_error(code)
     unsupported = False
+    fallback_stage, fallback_code = None, 0
     try:
         tag = AttributeTag()
         identity = FileIdentity()
@@ -72,11 +79,14 @@ def root_stat(path, counts=None):
                 code = last_error()
                 if code in (1, 50, 87, 120):
                     unsupported = True
+                    fallback_stage = 'attributeTag' if kind == 9 else 'fileId'
+                    fallback_code = code
                     break
                 raise win_error(code)
         # 非链接重解析点由 Python 保持原有文件系统专用语义。
         if tag.attributes & 0x400 and tag.tag not in (0xA0000003, 0xA000000C):
             unsupported = True
+            fallback_stage, fallback_code = 'reparse', 0
         if not unsupported:
             mode = stat.S_IFDIR if tag.attributes & 0x10 else stat.S_IFREG
             if tag.tag == 0xA000000C:
@@ -88,4 +98,39 @@ def root_stat(path, counts=None):
         # 包括查询异常和回退在内，每次都关闭句柄；不会跨文件缓存身份或句柄。
         if not _api.close(handle):
             raise win_error(last_error())
-    return fallback() if unsupported else result
+    return fallback(fallback_stage, fallback_code) if unsupported else result
+
+
+class RootIdentityReader:
+    """每个目录组独立选择查询方式；只记兼容性，不缓存任何目录身份。"""
+    def __init__(self, native=None):
+        self.native = native or root_stat
+        self.mode = None
+        self.probe_lock = threading.Lock()
+
+    def _native(self, path, counts):
+        previous = counts.get('rootNativeFallbacks', 0)
+        try:
+            result = self.native(path, counts)
+        finally:
+            if counts.get('rootNativeFallbacks', 0) > previous:
+                self.mode = False
+        # 另一线程可能已发现不兼容，不能被较早启动的成功查询重新启用。
+        if self.mode is None:
+            self.mode = True
+        return result
+
+    def __call__(self, path, counts=None):
+        if counts is None:
+            counts = {}
+        if self.mode is None:
+            # 首次只让一个线程探测，避免 32 个 worker 同时重复失败。
+            with self.probe_lock:
+                if self.mode is None:
+                    return self._native(path, counts)
+        if self.mode is False:
+            increment(counts, 'rootNativeBypassed')
+            increment(counts, 'lstatQueries')
+            return path.lstat()
+        # 正常核验与回退 lstat 均不持有探测锁，独立文件继续并行。
+        return self._native(path, counts)

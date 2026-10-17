@@ -16,7 +16,7 @@ from .comparison import compare, metadata, method_name, tolerance_ns
 from .scanning import scan_tree
 from .recovery import network_error, NetworkUnavailable
 from .path_attributes import windows_link, link_info, query
-from .root_identity import root_stat
+from .root_identity import root_stat, RootIdentityReader
 
 
 class UnsafePathError(RuntimeError):
@@ -104,6 +104,7 @@ def _synchronize_one(config, emit):
     source_identity = (source_info.st_dev, source_info.st_ino)
     target_info = dst.stat() if dst.exists() else None
     target_identity = (target_info.st_dev, target_info.st_ino) if target_info else None
+    root_reader = RootIdentityReader(root_stat)
     stop = threading.Event()
     from .file_locks import FilePublishLocks
     publish_locks = FilePublishLocks()
@@ -133,7 +134,7 @@ def _synchronize_one(config, emit):
                 if os.name == 'nt' and candidate == dst and target_identity is not None:
                     counts['rootIdentityQueries'] = 1
                     try:
-                        current = query(lambda: root_stat(dst, counts), dst, counts, 'identity', 'targetRoot')
+                        current = query(lambda: root_reader(dst, counts), dst, counts, 'identity', 'targetRoot')
                     except OSError as error:
                         raise_network(error)
                         raise UnsafePathError('目标根目录已失效或被替换，终止同步及删除') from error
