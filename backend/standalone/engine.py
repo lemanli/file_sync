@@ -29,7 +29,18 @@ def digest(path):
     return value.digest()
 
 
+def windows_link(path):
+    # 一次不跟随链接的属性读取，同时识别符号链接和目录联接。
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or getattr(info, 'st_reparse_tag', 0) == 0xA0000003
+
+
 def is_link(path):
+    if os.name == 'nt':
+        return windows_link(path)
     return path.is_symlink() or (hasattr(path,'is_junction') and path.is_junction())
 
 
@@ -110,7 +121,7 @@ def _synchronize_one(config, emit):
     def check_source():
         try:
             current = src.stat()
-            valid = not is_link(src) and src.is_dir() and (current.st_dev, current.st_ino) == source_identity
+            valid = not is_link(src) and stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == source_identity
         except OSError as error:
             raise_network(error)
             valid = False
@@ -122,7 +133,7 @@ def _synchronize_one(config, emit):
         if target_identity is not None:
             try:
                 current = dst.stat()
-                valid = dst.is_dir() and (current.st_dev, current.st_ino) == target_identity
+                valid = stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == target_identity
             except OSError as error:
                 raise_network(error)
                 valid = False
@@ -274,9 +285,10 @@ def _synchronize_one(config, emit):
                     return dict(path=str(relative),action='skipped',bytes=0,comparison=detail,reason=detail['reason'])
 
         source, target = src / relative, dst / relative
+        progress('file', path=str(relative), size=0, written=0, phase='path_check')
         check_target(target)
         # 发布前再次检查路径，避免写入已被替换为链接的目录。
-        for path in (source, target):
+        for path in (source,):
             if any(is_link(p) for p in (path, *path.parents)):
                 raise UnsafePathError(f'复制路径出现符号链接：{path}')
         expected = config.get('_expected', {}).get(relative)
@@ -312,17 +324,21 @@ def _synchronize_one(config, emit):
         if equal:
             return dict(path=str(relative), action='skipped', bytes=0, comparison=detail, reason=detail['reason'])
         if not dry:
+            progress('file', path=str(relative), size=before.st_size, written=0, phase='creating')
             if not optimized:
                 target.parent.mkdir(parents=True, exist_ok=True)
             fd, temp_name = tempfile.mkstemp(prefix='.sync-', dir=target.parent)
             temp = Path(temp_name)
+            replaced = False
             try:
                 # 大文件流式写入，不拆文件。带宽限制按工作线程分摊。
                 limit = config.get('bandwidthLimit', 0) * 1024 / parallelism
                 tick, written = time.monotonic(), 0
                 reported, reported_at = 0, tick
+                progress('file', path=str(relative), size=before.st_size, written=0, phase='opening')
                 with os.fdopen(fd, 'wb') as output, source_stream(source, before) as stream:
                     try:
+                        progress('file', path=str(relative), size=before.st_size, written=0, phase='copying')
                         for block in iter(lambda: stream.read(1024 * 1024), b''):
                             check_stop()
                             output.write(block)
@@ -332,10 +348,12 @@ def _synchronize_one(config, emit):
                                 reported, reported_at = written, time.monotonic()
                             if limit:
                                 stop.wait(max(0, written / limit - (time.monotonic() - tick)))
+                        progress('file', path=str(relative), size=before.st_size, written=written, phase='flushing')
                         output.flush()
                         os.fsync(output.fileno())
                     finally:
                         progress('written', path=str(relative), size=before.st_size, written=written, delta=written-reported)
+                progress('file', path=str(relative), size=before.st_size, written=written, phase='validating')
                 after = source.stat()
                 if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
                     raise RuntimeError(f'复制期间源文件发生变化：{relative}')
@@ -367,15 +385,17 @@ def _synchronize_one(config, emit):
                     raise RuntimeError(f'目标文件系统无法在时间容差内保留源修改时间：{relative}（差 {difference/1_000_000_000:g} 秒）')
                 progress('file', path=str(relative), size=before.st_size, written=written, phase='publish_wait')
                 with publish_locks.hold(target):
-                    progress('file', path=str(relative), size=before.st_size, written=written, phase='publishing')
+                    progress('file', path=str(relative), size=before.st_size, written=written, phase='source_check')
                     check_stop()
                     check_source()
+                    progress('file', path=str(relative), size=before.st_size, written=written, phase='target_check')
                     check_target(target)
                     if expected is not None:
                         from .two_way import fingerprint
                         if fingerprint(source) != expected[0] or fingerprint(target) != expected[1]:
                             raise RuntimeError(f'源或目标在复制期间发生变化：{relative}')
                     check_stop()
+                    progress('file', path=str(relative), size=before.st_size, written=written, phase='renaming')
                     if optimized and config['syncStrategy']=='SKIP_EXISTING':
                         from .publication import publish_if_absent
                         if not publish_if_absent(temp,target):
@@ -383,8 +403,11 @@ def _synchronize_one(config, emit):
                                         reason='目标在目录枚举后出现，原子不覆盖发布已保留该目标')
                     else:
                         os.replace(temp, target)
+                        replaced = True
             finally:
-                temp.unlink(missing_ok=True)
+                if not replaced:
+                    progress('file', path=str(relative), size=before.st_size, written=written, phase='cleanup')
+                    temp.unlink(missing_ok=True)
         event = dict(path=str(relative), action='copied', bytes=before.st_size, comparison=detail, reason=detail['reason'])
         if timestamps is not None:
             event['timestamps'] = timestamps
@@ -408,11 +431,13 @@ def _synchronize_one(config, emit):
                     except Exception as error:
                         raise_network(error)
                         if attempt < config.get('maxRetries', 2):
+                            progress('file', path=str(relative), size=0, written=0, phase='file_retry')
                             time.sleep(config.get('retryInterval', 1))
                             continue
                         event = dict(path=str(relative), action='failed', bytes=0, error=str(error))
                     event['retries'] = attempt
                     # 日志失败不能重试已经成功发布的文件。
+                    progress('file', path=str(relative), size=event.get('bytes',0), written=event.get('bytes',0), phase='logging')
                     emit(event)
                     events.append(event)
                     progress('file_done')

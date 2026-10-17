@@ -76,6 +76,6 @@ class SizeSnapshotTests(unittest.TestCase):
                 self.assertEqual(response.status_code,200,response.text)
                 saved=client.get('/api/tasks').json()[0]
                 self.assertEqual((saved['scanMemoryMb'],saved['comparisonMode']),(1024,'size'))
-                self.assertEqual(client.get('/api/health').json()['configSchemaVersion'],4)
+                self.assertEqual(client.get('/api/health').json()['configSchemaVersion'],5)
                 task['scanMemoryMb']=0
                 self.assertEqual(client.post('/api/tasks',json=task,headers={'X-Sync-Local':'1'}).status_code,422)

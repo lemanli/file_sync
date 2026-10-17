@@ -4,8 +4,8 @@ const el=id=>document.getElementById(id);
 const form=el('form');
 const state={backendReady:false,tab:'tasks',tasks:[],runs:[],taskPage:1,runPage:1,taskFilter:null,editing:null,dirty:false,loaded:false,busy:false,runPending:false,logRun:null,logRows:[],logPage:1,logTotal:0,logPages:1,logRequest:0};
 const names={retry_wait:'等待网络重试',pausing:'正在暂停',paused:'已暂停',running:'执行中',partial:'部分完成',preview_partial:'演练有问题',success:'成功',preview:'演练完成',failed:'失败',interrupted:'已中断'};
-const actions={network_retry:'网络等待重试',network_retry_exhausted:'网络重试用尽',control:'执行控制',config_updated:'参数修改',preflight:'目标权限检查',ignored:'规则忽略',conflict:'文件冲突',deletion_skipped:'已暂停删除',mapping_started:'目录组开始',mapping_completed:'目录组完成',mapping_failed:'目录组失败',copied:'复制',skipped:'跳过',deleted:'删除',failed:'文件失败'};
-const defaults={name:'',syncStrategy:'AUTO',scanWorkers:1,scanMemoryMb:256,scannerBackend:'auto',direction:'one_way',conflictPolicy:'skip',ignorePatterns:[],continueOnError:false,networkRetryCount:3,networkRetryMinutes:3,parallelism:4,batchFiles:100,largeThresholdMb:512,bandwidthLimit:0,maxRetries:2,retryInterval:1,comparisonMode:'size',preserveTime:true,timeToleranceSeconds:2,skipUnsupported:true,updateOnly:false,delete:false};
+const actions={performance_debug:'性能诊断',network_retry:'网络等待重试',network_retry_exhausted:'网络重试用尽',control:'执行控制',config_updated:'参数修改',preflight:'目标权限检查',ignored:'规则忽略',conflict:'文件冲突',deletion_skipped:'已暂停删除',mapping_started:'目录组开始',mapping_completed:'目录组完成',mapping_failed:'目录组失败',copied:'复制',skipped:'跳过',deleted:'删除',failed:'文件失败'};
+const defaults={name:'',syncStrategy:'AUTO',scanWorkers:1,debugPerformance:false,scanMemoryMb:256,scannerBackend:'auto',direction:'one_way',conflictPolicy:'skip',ignorePatterns:[],continueOnError:false,networkRetryCount:3,networkRetryMinutes:3,parallelism:4,batchFiles:100,largeThresholdMb:512,bandwidthLimit:0,maxRetries:2,retryInterval:1,comparisonMode:'size',preserveTime:true,timeToleranceSeconds:2,skipUnsupported:true,updateOnly:false,delete:false};
 const pageSize=10;
 const activeRun=run=>run&&['running','pausing','paused','retry_wait'].includes(run.status);
 async function controlRun(run,action){try{await api(`/runs/${run.id}/${action}`,'POST',{});await refresh(true)}catch(error){report(error)}}
@@ -75,7 +75,7 @@ function renderTasks(){
  }
 }
 // 每两秒展示一次有界快照；进度不依赖逐条读取文件日志。
-const phaseNames={checking:'检查目标读写权限',queued:'等待启动',scanning:'扫描目录',planning:'双向比较与规划',syncing:'比较与同步',copying:'写入临时文件',comparing:'比较文件',verifying:'校验写入内容',metadata:'写入权限和时间',publish_wait:'等待发布锁',publishing:'检查路径并发布文件',finalizing:'清理与收尾'};
+const phaseNames={creating:'创建临时文件',opening:'打开源和临时文件',validating:'复核源变化和临时文件长度',path_check:'复制前路径检查',flushing:'刷新临时文件到存储',source_check:'复核源根目录',target_check:'复核目标路径',renaming:'原子重命名发布',cleanup:'清理临时文件',logging:'等待日志记录',file_retry:'等待文件重试',checking:'检查目标读写权限',queued:'等待启动',scanning:'扫描目录',planning:'双向比较与规划',syncing:'比较与同步',copying:'写入临时文件',comparing:'比较文件',verifying:'校验写入内容',metadata:'写入权限和时间',publish_wait:'等待发布锁',publishing:'检查路径并发布文件',finalizing:'清理与收尾'};
 let lastProgressRefresh=0,progressDisconnected=false;
 function progressFreshness(failed=false){
  const box=el('liveProgress');if(box.hidden)return;
@@ -102,6 +102,7 @@ function renderProgress(box,run){
  if(p.phase==='scanning'||p.phase==='planning'){box.append(node('p',`扫描 ${(p.scanEntriesPerSecond??0).toFixed(0)} 条目/秒 · ${p.scanSide==='target'?'目标端':p.scanSide==='source'?'源端':'两端规划'}`));if(p.scanPath)box.append(node('p',p.scanPath,'active-path'))}
  const settings=parse(run.snapshot);
  box.append(node('p',`活动文件 ${p.activeFiles.length} / 并发上限 ${settings.parallelism??4} · 入队批量 ${settings.batchFiles??100} · ${(settings.syncStrategy&&settings.syncStrategy!=='AUTO')||(settings.comparisonMode==='size'&&settings.direction!=='bidirectional'&&!settings.updateOnly)?`目录并发上限 ${settings.scanWorkers??1}`:'兼容扫描（目录并发不适用）'}`));
+ if(p.phaseTimings){const slow=Object.entries(p.phaseTimings).sort((a,b)=>b[1].seconds-a[1].seconds).slice(0,4);if(slow.length)box.append(node('p','阶段累计耗时（线程时间之和）：'+slow.map(([name,value])=>`${phaseNames[name]||name} ${value.seconds.toFixed(1)}秒 / ${value.count}次`).join(' · ')));}
  const c=p.counts;
  box.append(node('p',`${dry?'预计':''}复制 ${c.copied} · 跳过 ${c.skipped} · 失败 ${c.failed} · 冲突 ${c.conflicts} · 忽略 ${c.ignored} · 删除 ${c.deleted}`));
  box.append(node('p',`近期处理 ${p.filesPerSecond.toFixed(1)} 文件/秒 · 写入 ${bytes(p.bytesPerSecond)}/秒 · 累计写入 ${bytes(p.writtenBytes)}`));
@@ -139,7 +140,7 @@ async function refresh(manual=false){
  if(state.busy)return;state.busy=true;
  try{
   const [tasks,runs,health]=await Promise.all([api('/tasks'),api('/runs'),api('/health')]);
-  state.backendReady=health.configSchemaVersion===4&&health.taskControlVersion===1&&health.networkRecoveryVersion===1&&health.scanArchitectureVersion===1&&health.comparisonDetailsVersion===1&&health.timeOptionsVersion===1&&health.progressVersion===1&&health.logQueryVersion===1;
+  state.backendReady=health.configSchemaVersion===5&&health.taskControlVersion===1&&health.networkRecoveryVersion===1&&health.scanArchitectureVersion===1&&health.comparisonDetailsVersion===1&&health.timeOptionsVersion===1&&health.progressVersion===1&&health.logQueryVersion===1;
   const changed=JSON.stringify(tasks)!==JSON.stringify(state.tasks)||JSON.stringify(runs)!==JSON.stringify(state.runs)||!state.loaded;
   state.tasks=tasks;state.runs=runs;state.loaded=true;el('connection').textContent=state.backendReady?'● 本机已连接':'○ 后台版本过旧，请重启';if(['connection','compatibility'].includes(el('message').dataset.kind))el('message').hidden=true;
   if(!state.backendReady){message(`网页与后台接口不兼容（后台 ${health.releaseVersion||'未标识版本'}，配置接口 ${health.configSchemaVersion??'未知'}）。请先刷新网页；仍不匹配时再重启单机程序。保存和运行已暂停，避免配置丢失。`,true);el('message').dataset.kind='compatibility'}
@@ -179,7 +180,7 @@ function startEditor(task=null,copy=false){
  updateDirection();el('mappings').replaceChildren();(task?mappingsOf(task):[{}]).forEach(addMapping);
  const current=!copy&&task?state.runs.find(r=>r.task_id===task.id&&activeRun(r)):null;
  if(current){
-  const editable=['name','bandwidthLimit','maxRetries','retryInterval','continueOnError','scanWorkers','parallelism','batchFiles','largeThresholdMb','networkRetryCount','networkRetryMinutes'];
+  const editable=['name','bandwidthLimit','maxRetries','retryInterval','continueOnError','debugPerformance','scanWorkers','parallelism','batchFiles','largeThresholdMb','networkRetryCount','networkRetryMinutes'];
   for(const input of form.querySelectorAll('[name]'))input.disabled=current.status!=='paused'||!editable.includes(input.name);
   for(const input of el('mappings').querySelectorAll('input,button'))input.disabled=true;
   el('addMapping').disabled=current.status!=='paused';el('applyPreset').disabled=true;el('rulePreset').disabled=true;
@@ -258,6 +259,7 @@ function renderLogs(){
  const path=cell(tr);path.append(node('span',`目录组 ${event.mappingIndex??'—'}${event.direction==='source_to_target'?' · 源 → 目标':event.direction==='target_to_source'?' · 目标 → 源':event.direction==='both'?' · 两端比较':''}`,'cell-sub'),node('span',event.path||`${event.source||''} → ${event.target||''}`));
  const detail=cell(tr);detail.append(node('span',event.error||event.reason|| (event.action==='mapping_completed'?'本组处理完成':event.bytes!=null?`${bytes(event.bytes)}${event.retries?` · 重试 ${event.retries} 次`:''}`:'—')));
  if(event.retryCount!=null)detail.append(node('span',`网络重试 ${event.retryCount}/${event.retryLimit} · ${event.waitSeconds==null?'次数已用尽，等待管理员恢复':event.waitSeconds+' 秒后重试'}`,'cell-sub'));
+ if(event.action==='performance_debug'){const info=node('details',undefined,'log-detail');info.append(node('summary','查看性能诊断 JSON'),node('pre',JSON.stringify(event,null,2)));detail.append(info)}
  if(event.comparison){const info=node('details',undefined,'log-detail comparison-detail');info.append(node('summary','查看大小 / 时间 / 哈希比较'));const lines=['比较方式：'+comparisonLabel({comparisonMode:event.comparison.method}), '判断：'+event.comparison.reason];for(const [key,label] of [['source','源文件'],['target','执行前目标文件']]){const item=event.comparison[key];lines.push(item?`${label}：${item.size} 字节；修改时间 ${item.mtimeNs==null?'未采集（仅大小快照）':date(Number(item.mtimeNs)/1e6)}；纳秒时间戳 ${item.mtimeNs}；SHA-256：${item.sha256||'未计算'}`:`${label}：不存在`)}lines.push('时间容差：'+(event.comparison.timeToleranceSeconds??0)+' 秒');if(event.timestamps)lines.push('复制后修改时间：'+date(Number(event.timestamps.targetMtimeNs)/1e6)+'；'+(event.timestamps.preserved?'保留源修改时间':'使用写入时间')+'；与源相差 '+Number(event.timestamps.differenceNs)/1e9+' 秒');if(event.verification)lines.push('写入后 SHA-256：'+event.verification.writtenSha256);info.append(node('pre',lines.join('\n')));detail.append(info)}
  const raw=node('details',undefined,'log-detail');raw.append(node('summary','原始详情'),node('pre',JSON.stringify(event,null,2)));detail.append(raw);
  }
@@ -345,3 +347,8 @@ function updateScanStrategy(){
  if(explicit)el('modeHint').textContent={COPY_ALL:'全部覆盖：仅扫描源；现有同名文件也会重新写入。',SKIP_EXISTING:'已有名称即跳过，不读取大小、时间或内容。',COMPARE_SIZE:'按目录快照仅比较大小；时间差不会触发复制，相同大小的内容变化不会被识别。',COMPARE_METADATA:'按目录比较大小和时间；相同则跳过，时间容差仍生效。',MIRROR:'镜像将删除目标多余内容；仅在复制和扫描无错误后执行删除。'}[strategy];
 }
 el('syncStrategy').addEventListener('change',updateScanStrategy);
+
+el('exportDiagnostics').onclick=async()=>{
+ if(!state.logRun)return;
+ try{const data=await api(`/runs/${state.logRun.id}/diagnostics`),url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'})),link=document.createElement('a');link.href=url;link.download=`file-sync-run-${state.logRun.id}-diagnostics.json`;document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000)}catch(error){report(error)}
+};

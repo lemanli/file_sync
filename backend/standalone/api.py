@@ -2,6 +2,8 @@
 from __future__ import annotations
 import json
 import hashlib
+import time
+import platform
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -70,6 +72,7 @@ class Task(BaseModel):
     direction: Literal['one_way', 'bidirectional'] = 'one_way'
     syncStrategy: Literal['AUTO', 'COPY_ALL', 'SKIP_EXISTING', 'COMPARE_SIZE', 'COMPARE_METADATA', 'MIRROR'] = 'AUTO'
     scanWorkers: int = Field(default=1, ge=1, le=32)
+    debugPerformance: bool = False
     scanMemoryMb: int = Field(default=256, ge=16, le=16384)
     scannerBackend: Literal['auto','portable','macos','linux','windows_bulk','windows_find'] = 'auto'
     conflictPolicy: Literal['skip', 'newer'] = 'skip'
@@ -216,7 +219,7 @@ def create_app(database):
 
     @app.get('/api/health')
     def health():
-        return {'releaseVersion': __version__, 'mode': 'standalone', 'database': 'sqlite', 'version': 1, 'configSchemaVersion': 4, 'taskControlVersion': 1, 'networkRecoveryVersion': 1, 'scanArchitectureVersion': 1, 'comparisonDetailsVersion': 1, 'timeOptionsVersion': 1, 'progressVersion': 1, 'logQueryVersion': 1}
+        return {'releaseVersion': __version__, 'mode': 'standalone', 'database': 'sqlite', 'version': 1, 'configSchemaVersion': 5, 'taskControlVersion': 1, 'networkRecoveryVersion': 1, 'scanArchitectureVersion': 1, 'comparisonDetailsVersion': 1, 'timeOptionsVersion': 1, 'progressVersion': 1, 'logQueryVersion': 1}
 
     @app.get('/api/tasks')
     def tasks():
@@ -256,7 +259,7 @@ def create_app(database):
                 original = old['pathMappings']
                 if len(new['pathMappings']) < len(original) or new['pathMappings'][:len(original)] != original:
                     raise HTTPException(409, '暂停任务不能删除、修改或重排已有目录组，只能追加目录组')
-                allowed = {'name', 'bandwidthLimit', 'maxRetries', 'retryInterval', 'continueOnError', 'scanWorkers', 'parallelism', 'batchFiles', 'largeThresholdMb', 'networkRetryCount', 'networkRetryMinutes', 'pathMappings'}
+                allowed = {'name', 'bandwidthLimit', 'maxRetries', 'retryInterval', 'continueOnError', 'scanWorkers', 'parallelism', 'batchFiles', 'largeThresholdMb', 'networkRetryCount', 'networkRetryMinutes', 'debugPerformance', 'pathMappings'}
                 if any(old[k] != new[k] for k in old.keys() - allowed):
                     raise HTTPException(409, '暂停时仅可调整限速、重试、遇错继续、并发和批量参数；同步规则需结束后修改')
                 effective = validate_task(new)
@@ -293,6 +296,7 @@ def create_app(database):
         buffer = []
         event_totals = dict(copied=0, skipped=0, deleted=0, ignored=0, failed=0, conflicts=0, bytes=0)
         buffer_lock = threading.RLock()
+        next_debug = time.monotonic()+10
         def flush():
             with buffer_lock:
                 if buffer:
@@ -301,6 +305,7 @@ def create_app(database):
                     buffer.clear()
         control.flush = flush
         def emit(event):
+            nonlocal next_debug
             with buffer_lock:
                 progress.update('event', action=event.get('action'))
                 key = 'conflicts' if event.get('action') == 'conflict' else event.get('action')
@@ -309,6 +314,10 @@ def create_app(database):
                 if key == 'copied':
                     event_totals['bytes'] += event.get('bytes', 0)
                 buffer.append((run_id, now(), json.dumps(event, ensure_ascii=False)))
+                if config.get('debugPerformance') and time.monotonic() >= next_debug:
+                    next_debug = time.monotonic()+10
+                    detail = dict(action='performance_debug', reason='阶段耗时为各线程累计时间，不等于墙钟耗时；慢文件最多每10秒抽样5个', **progress.diagnostics())
+                    buffer.append((run_id, now(), json.dumps(detail, ensure_ascii=False)))
                 if len(buffer) >= 100:
                     flush()
         def with_network_retry(operation, mapping_index):
@@ -379,6 +388,8 @@ def create_app(database):
                 except Exception as error:
                     mapping_emit(dict(action='mapping_failed', error=str(error)))
                     raise
+            if config.get('debugPerformance'):
+                emit(dict(action='performance_debug', reason='任务结束性能汇总', **progress.diagnostics()))
             control.close()
             result = {key: sum(r[key] for r in summaries) for key in ('copied', 'skipped', 'deleted', 'bytes', 'scanned', 'durationSeconds', 'unsupportedSkipped', 'ignored', 'failed', 'conflicts')}
             result.update(event_totals)
@@ -476,6 +487,22 @@ def create_app(database):
                     row['recovery'] = controls[row['id']].recovery
         return rows
 
+    @app.get('/api/runs/{run_id}/diagnostics')
+    def diagnostics(run_id: int):
+        with connect() as db:
+            row = db.execute('SELECT * FROM runs WHERE id=?', (run_id,)).fetchone()
+            if row is None:
+                raise HTTPException(404, '执行记录不存在')
+            run = dict(row)
+            rows = db.execute("SELECT created,detail FROM events WHERE run_id=? AND json_extract(detail,'$.action')='performance_debug' ORDER BY id DESC LIMIT 20", (run_id,)).fetchall()
+            recent = [dict(created=item['created'], detail=json.loads(item['detail'])) for item in rows]
+        with live_lock:
+            progress = live[run_id].snapshot() if run_id in live else json.loads(run['result'] or '{}').get('progress', {})
+        return dict(releaseVersion=__version__, exportedAt=now(), pythonVersion=platform.python_version(),
+                    system=platform.system(), systemRelease=platform.release(), runId=run_id,
+                    status=run['status'], error=run['error'], config=json.loads(run['snapshot'] or '{}'),
+                    progress=progress, recentDiagnostics=recent)
+
     @app.get('/api/runs/{run_id}/report')
     def report(run_id: int):
         # 从已持久化日志汇总，失败/中断的任务也能看到已完成的工作。
@@ -496,7 +523,7 @@ def create_app(database):
                    q: str = Query('', max_length=256),
                    mapping: int | None = Query(None, ge=1),
                    order: Literal['asc', 'desc'] = 'asc'):
-        allowed = {'copied','skipped','ignored','failed','conflict','deleted','mapping_started','mapping_completed','mapping_failed','deletion_skipped','preflight','control','config_updated','network_retry','network_retry_exhausted'}
+        allowed = {'copied','skipped','ignored','failed','conflict','deleted','mapping_started','mapping_completed','mapping_failed','deletion_skipped','preflight','control','config_updated','network_retry','network_retry_exhausted','performance_debug'}
         if action and action not in allowed:
             raise HTTPException(422, '不支持的日志状态')
         clauses, values = ['run_id=?'], [run_id]

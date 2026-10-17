@@ -1,6 +1,7 @@
 """有界的实时进度：只保存计数及活动线程，不积累文件历史。"""
 import threading
 import time
+from collections import deque
 
 
 class Progress:
@@ -16,8 +17,35 @@ class Progress:
         self.scan_complete = False
         self.counts = dict(copied=0, skipped=0, failed=0, ignored=0, deleted=0, conflicts=0)
         self.active = {}
+        self.phase_totals = {}
+        self.file_timings = {}
+        self.slow_files = deque(maxlen=5)
+        self.sample_window = self.started
+        self.sample_count = 0
         self.scan_metrics = {}
         self.samples = [(self.started, 0, 0, 0)]
+
+    def _record_phase(self, identity, current):
+        active = self.active.get(identity)
+        if not active:
+            return
+        phase = active['phase']
+        seconds = max(0, current-active.get('phaseStarted', current))
+        total = self.phase_totals.setdefault(phase, dict(seconds=0, count=0, maxSeconds=0))
+        total['seconds'] += seconds
+        total['count'] += 1
+        total['maxSeconds'] = max(total['maxSeconds'], seconds)
+        timings = self.file_timings.setdefault(identity, {})
+        timings[phase] = timings.get(phase, 0)+seconds
+
+    def diagnostics(self):
+        snapshot = self.snapshot()
+        with self.lock:
+            samples = list(self.slow_files)
+            self.slow_files.clear()
+        return dict(phaseTimings=snapshot['phaseTimings'], slowFiles=samples,
+                    activeFiles=snapshot['activeFiles'], counts=snapshot['counts'],
+                    elapsedSeconds=snapshot['elapsedSeconds'], scanMetrics=snapshot['scanMetrics'])
 
     def update(self, kind, **data):
         with self.lock:
@@ -28,6 +56,7 @@ class Progress:
                 self.total = None
                 self.scan_complete = False
                 self.active.clear()
+                self.file_timings.clear()
             elif kind == 'metrics':
                 self.scan_metrics = dict(data)
             elif kind == 'scan':
@@ -44,16 +73,28 @@ class Progress:
             elif kind == 'phase':
                 self.phase = data['phase']
             elif kind == 'file':
+                self._record_phase(threading.get_ident(), time.monotonic())
                 self.active[threading.get_ident()] = dict(data, phaseStarted=time.monotonic())
             elif kind == 'written':
                 self.written += data['delta']
                 previous = self.active.get(threading.get_ident(), {})
-                started = previous.get('phaseStarted', time.monotonic()) if previous.get('phase') == 'copying' else time.monotonic()
-                self.active[threading.get_ident()] = dict(path=data['path'], size=data['size'], written=data['written'], phase='copying', phaseStarted=started)
+                phase = 'flushing' if previous.get('phase') == 'flushing' else 'copying'
+                if previous.get('phase') != phase:
+                    self._record_phase(threading.get_ident(), time.monotonic())
+                started = previous.get('phaseStarted', time.monotonic()) if previous.get('phase') == phase else time.monotonic()
+                self.active[threading.get_ident()] = dict(path=data['path'], size=data['size'], written=data['written'], phase=phase, phaseStarted=started)
             elif kind == 'clear_file':
                 self.active.pop(threading.get_ident(), None)
             elif kind == 'file_done':
-                self.active.pop(threading.get_ident(), None)
+                identity = threading.get_ident(); current = time.monotonic()
+                self._record_phase(identity, current)
+                active = self.active.pop(identity, None)
+                timings = self.file_timings.pop(identity, {})
+                if current-self.sample_window >= 10:
+                    self.sample_window = current; self.sample_count = 0
+                if active and sum(timings.values()) >= 1 and self.sample_count < 5:
+                    self.slow_files.append(dict(path=active['path'], seconds=sum(timings.values()), phases=timings))
+                    self.sample_count += 1
                 self.finished += 1
             elif kind == 'event':
                 action = data['action']
@@ -72,7 +113,8 @@ class Progress:
                 self.samples.pop(0)
             first = self.samples[0]
             seconds = max(current - first[0], .001)
-            return dict(scanMetrics=dict(self.scan_metrics),
+            return dict(phaseTimings={key:dict(value) for key,value in self.phase_totals.items()},
+                        scanMetrics=dict(self.scan_metrics),
                         sourceScanRate=self.scan_metrics.get('sourceEntries',0)/max(current-self.started,.001),
                         targetScanRate=self.scan_metrics.get('targetEntries',0)/max(current-self.started,.001),
                         directoriesPerSecond=(self.scan_metrics.get('sourceDirectories',0)+self.scan_metrics.get('targetDirectories',0))/max(current-self.started,.001),
