@@ -16,6 +16,7 @@ from .comparison import compare, metadata, method_name, tolerance_ns
 from .scanning import scan_tree
 from .recovery import network_error, NetworkUnavailable
 from .path_attributes import windows_link, link_info, query
+from .root_identity import root_stat
 
 
 class UnsafePathError(RuntimeError):
@@ -99,8 +100,10 @@ def _synchronize_one(config, emit):
         with event_lock:
             callback(event)
     src, dst = roots(config['source'], config['target'])
-    source_identity = (src.stat().st_dev, src.stat().st_ino)
-    target_identity = (dst.stat().st_dev, dst.stat().st_ino) if dst.exists() else None
+    source_info = src.stat()
+    source_identity = (source_info.st_dev, source_info.st_ino)
+    target_info = dst.stat() if dst.exists() else None
+    target_identity = (target_info.st_dev, target_info.st_ino) if target_info else None
     stop = threading.Event()
     from .file_locks import FilePublishLocks
     publish_locks = FilePublishLocks()
@@ -126,12 +129,11 @@ def _synchronize_one(config, emit):
         current = None
         try:
             for candidate in (path, *path.parents):
-                # Windows 根目录的同一次 lstat 同时提供链接类型与身份，避免重复查询。
+                # Windows 根目录以短生命周期共享句柄同时核验链接类型与身份。
                 if os.name == 'nt' and candidate == dst and target_identity is not None:
                     counts['rootIdentityQueries'] = 1
-                    counts['lstatQueries'] = counts.get('lstatQueries', 0) + 1
                     try:
-                        current = query(dst.lstat, dst, counts, 'identity', 'targetRoot')
+                        current = query(lambda: root_stat(dst, counts), dst, counts, 'identity', 'targetRoot')
                     except OSError as error:
                         raise_network(error)
                         raise UnsafePathError('目标根目录已失效或被替换，终止同步及删除') from error
@@ -271,7 +273,8 @@ def _synchronize_one(config, emit):
     if not dry:
         dst.mkdir(parents=True, exist_ok=True)
         if target_identity is None:
-            target_identity = (dst.stat().st_dev, dst.stat().st_ino)
+            target_info = dst.stat()
+            target_identity = (target_info.st_dev, target_info.st_ino)
 
     @contextmanager
     def source_stream(path, before):
