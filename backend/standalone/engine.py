@@ -15,7 +15,7 @@ from .rules import IgnoreRules
 from .comparison import compare, metadata, method_name, tolerance_ns
 from .scanning import scan_tree
 from .recovery import network_error, NetworkUnavailable
-from .path_attributes import windows_link, link_info
+from .path_attributes import windows_link, link_info, query
 
 
 class UnsafePathError(RuntimeError):
@@ -122,7 +122,7 @@ def _synchronize_one(config, emit):
         if not valid:
             raise UnsafePathError('源目录已失效或被替换，终止同步及删除')
     def check_target(path):
-        counts = dict(targetChecks=1)
+        counts = dict(targetChecks=1, _details=bool(config.get('debugPerformance')))
         current = None
         try:
             for candidate in (path, *path.parents):
@@ -131,7 +131,7 @@ def _synchronize_one(config, emit):
                     counts['rootIdentityQueries'] = 1
                     counts['lstatQueries'] = counts.get('lstatQueries', 0) + 1
                     try:
-                        current = dst.lstat()
+                        current = query(dst.lstat, dst, counts, 'identity', 'targetRoot')
                     except OSError as error:
                         raise_network(error)
                         raise UnsafePathError('目标根目录已失效或被替换，终止同步及删除') from error
@@ -144,7 +144,7 @@ def _synchronize_one(config, emit):
                 try:
                     if current is None:
                         counts['rootIdentityQueries'] = 1
-                        current = dst.stat()
+                        current = query(dst.stat, dst, counts, 'identity', 'targetRoot')
                     valid = stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == target_identity
                 except OSError as error:
                     raise_network(error)
@@ -152,7 +152,9 @@ def _synchronize_one(config, emit):
                 if not valid:
                     raise UnsafePathError('目标根目录已失效或被替换，终止同步及删除')
         finally:
-            config.get('_progress', lambda *args, **kwargs: None)('path_metrics', **counts)
+            counts.pop('_details', None)
+            samples = counts.pop('_samples', [])
+            config.get('_progress', lambda *args, **kwargs: None)('path_metrics', samples=samples, **counts)
     def check_stop():
         if stop.is_set():
             if network_failure:

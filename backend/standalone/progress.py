@@ -24,6 +24,9 @@ class Progress:
         self.sample_count = 0
         self.scan_metrics = {}
         self.path_check_metrics = {}
+        self.path_check_samples = deque(maxlen=8)
+        self.path_sample_window = self.started
+        self.path_sample_count = 0
         self.samples = [(self.started, 0, 0, 0)]
 
     def _record_phase(self, identity, current):
@@ -46,7 +49,7 @@ class Progress:
             self.slow_files.clear()
         return dict(phaseTimings=snapshot['phaseTimings'], slowFiles=samples,
                     activeFiles=snapshot['activeFiles'], counts=snapshot['counts'],
-                    elapsedSeconds=snapshot['elapsedSeconds'], scanMetrics=snapshot['scanMetrics'], pathCheckMetrics=snapshot['pathCheckMetrics'])
+                    elapsedSeconds=snapshot['elapsedSeconds'], scanMetrics=snapshot['scanMetrics'], pathCheckMetrics=snapshot['pathCheckMetrics'], pathCheckSamples=snapshot['pathCheckSamples'])
 
     def update(self, kind, **data):
         with self.lock:
@@ -59,6 +62,14 @@ class Progress:
                 self.active.clear()
                 self.file_timings.clear()
             elif kind == 'path_metrics':
+                current = time.monotonic()
+                if current-self.path_sample_window >= 10:
+                    self.path_sample_window = current
+                    self.path_sample_count = 0
+                for item in data.pop('samples', []):
+                    if self.path_sample_count < 8:
+                        self.path_check_samples.append(dict(item, elapsedSeconds=current-self.started))
+                        self.path_sample_count += 1
                 for key, value in data.items():
                     self.path_check_metrics[key] = self.path_check_metrics.get(key, 0) + value
             elif kind == 'metrics':
@@ -120,6 +131,7 @@ class Progress:
             return dict(phaseTimings={key:dict(value) for key,value in self.phase_totals.items()},
                         scanMetrics=dict(self.scan_metrics),
                         pathCheckMetrics=dict(self.path_check_metrics),
+                        pathCheckSamples=[dict(item) for item in self.path_check_samples],
                         sourceScanRate=self.scan_metrics.get('sourceEntries',0)/max(current-self.started,.001),
                         targetScanRate=self.scan_metrics.get('targetEntries',0)/max(current-self.started,.001),
                         directoriesPerSecond=(self.scan_metrics.get('sourceDirectories',0)+self.scan_metrics.get('targetDirectories',0))/max(current-self.started,.001),
